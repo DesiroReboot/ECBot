@@ -1,0 +1,14 @@
+config/
+.history/
+.tmp_test/
+DB/
+logs/
+scripts/
+Eval/
+Doc/
+src/__pycache__
+.env
+.env.local
+.env.*.local
+src/**/**/__pycache__
+tests/**/**/__pycache__
