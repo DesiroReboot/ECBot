@@ -5,7 +5,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from src.config import Config
+from src.core.generation import GenerationClient
 from src.core.search.rag_search import RAGSearcher
+from src.core.search.source_utils import build_grouped_citations
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.storage.manifest_store import ManifestStore
 
@@ -18,16 +20,35 @@ class AgentResponse:
     trace: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class AnswerDraft:
+    query: str
+    theme: str
+    steps: list[str]
+    evidence: list[str]
+    citations: list[dict[str, Any]]
+
+
 class ReActAgent:
     def __init__(self, config: Config):
         self.config = config
+        self.answer_top_k = max(
+            1,
+            int(max(config.search.rag_top_k, config.search.context_top_k)),
+        )
+        self.generation_client = GenerationClient(config.generation)
         self.kbase_config = KBaseConfig(
             db_path=config.database.db_path,
             source_dir=config.knowledge_base.source_dir,
             supported_extensions=config.knowledge_base.supported_extensions,
             auto_sync_on_startup=config.knowledge_base.auto_sync_on_startup,
+            ocr_enabled=config.knowledge_base.ocr_enabled,
+            ocr_language=config.knowledge_base.ocr_language,
+            ocr_dpi_scale=config.knowledge_base.ocr_dpi_scale,
+            ocr_trigger_readability=config.knowledge_base.ocr_trigger_readability,
+            min_chunk_readability=config.knowledge_base.min_chunk_readability,
             vector_dimension=config.embedding.dimension,
-            rag_top_k=config.search.rag_top_k,
+            rag_top_k=self.answer_top_k,
             fts_top_k=config.search.fts_top_k,
             vec_top_k=config.search.vec_top_k,
             fusion_rrf_k=config.search.fusion_rrf_k,
@@ -46,7 +67,7 @@ class ReActAgent:
         self.manifest_store = ManifestStore(config.database.db_path, ensure_schema=False)
         self.searcher = RAGSearcher(
             db_path=config.database.db_path,
-            top_k=config.search.rag_top_k,
+            top_k=self.answer_top_k,
             fts_top_k=config.search.fts_top_k,
             vec_top_k=config.search.vec_top_k,
             fusion_rrf_k=config.search.fusion_rrf_k,
@@ -94,9 +115,15 @@ class ReActAgent:
                 trace=trace if include_trace else {},
             )
 
-        selected = results[: self.config.search.rag_top_k]
+        selected = results[: self.answer_top_k]
         citations = self._build_citations(selected)
-        answer = self._build_human_answer(query=query, selected=selected)
+        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        template_answer = self._render_template_answer(draft)
+        answer, generation_meta = self._compose_answer(
+            draft=draft,
+            template_answer=template_answer,
+            search_trace=search_trace,
+        )
         confidence = min(
             1.0,
             sum(max(0.0, item.score) for item in selected) / max(len(selected), 1),
@@ -106,6 +133,12 @@ class ReActAgent:
             {
                 "stage": "context_selection",
                 "selected_results": [asdict(item) for item in selected],
+            }
+        )
+        trace["strategy_execution"].append(
+            {
+                "stage": "answer_generation",
+                "meta": generation_meta,
             }
         )
         trace["final_answer_preview"] = answer
@@ -121,41 +154,256 @@ class ReActAgent:
         )
 
     def _build_citations(self, selected: list[Any]) -> list[dict[str, Any]]:
-        citations: list[dict[str, Any]] = []
-        seen_sources: set[str] = set()
-        for item in selected:
-            source = str(getattr(item, "source", "")).strip()
-            if not source or source in seen_sources:
-                continue
-            seen_sources.add(source)
-            citations.append(
-                {
-                    "source": source,
-                    "title": source,
-                    "path": str(getattr(item, "source_path", "")),
-                }
-            )
-        return citations
+        return build_grouped_citations(selected)
 
-    def _build_human_answer(self, *, query: str, selected: list[Any]) -> str:
+    def _build_answer_draft(
+        self,
+        *,
+        query: str,
+        selected: list[Any],
+        citations: list[dict[str, Any]],
+    ) -> AnswerDraft:
         query_terms = self._query_terms(query)
         theme = self._detect_theme(query, selected)
         evidence = self._extract_evidence(query=query, selected=selected, limit=6)
         steps = self._build_thematic_steps(theme=theme, query_terms=query_terms)
+        return AnswerDraft(
+            query=query,
+            theme=theme,
+            steps=steps,
+            evidence=evidence,
+            citations=citations,
+        )
 
-        lines = [f"问题：{query}", "建议执行步骤："]
-        for idx, step in enumerate(steps, start=1):
+    def _compose_answer(
+        self,
+        *,
+        draft: AnswerDraft,
+        template_answer: str,
+        search_trace: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        requested_mode = str(self.config.generation.mode or "hybrid").strip().lower()
+        if requested_mode not in {"template", "hybrid", "llm_rewrite"}:
+            requested_mode = "hybrid"
+
+        generation_meta: dict[str, Any] = {
+            "requested_mode": requested_mode,
+            "final_mode": "template",
+            "fallback_reason": "",
+            "quality_score": 1.0,
+            "claim_support_rate": 1.0,
+            "citation_coverage": 1.0,
+        }
+        if requested_mode == "template":
+            return template_answer, generation_meta
+
+        abnormal_reason = self._generation_abnormal_reason(search_trace)
+        if abnormal_reason:
+            generation_meta["fallback_reason"] = abnormal_reason
+            return template_answer, generation_meta
+
+        try:
+            rewritten = self._hybrid_rewrite(draft=draft, template_answer=template_answer)
+        except Exception as exc:
+            generation_meta["fallback_reason"] = "hybrid_unavailable_or_error"
+            generation_meta["error"] = str(exc)
+            return template_answer, generation_meta
+
+        quality_score, quality_issues = self._evaluate_answer_quality(rewritten, draft)
+        claim_support_rate = self._estimate_claim_support(rewritten, draft.evidence)
+        citation_coverage = self._estimate_citation_coverage(rewritten, draft.citations)
+
+        generation_meta["quality_score"] = round(quality_score, 4)
+        generation_meta["claim_support_rate"] = round(claim_support_rate, 4)
+        generation_meta["citation_coverage"] = round(citation_coverage, 4)
+        if quality_issues:
+            generation_meta["quality_issues"] = quality_issues
+
+        if quality_score < float(self.config.generation.min_quality_score):
+            generation_meta["fallback_reason"] = "quality_below_threshold"
+            return template_answer, generation_meta
+        if claim_support_rate < float(self.config.generation.min_claim_support_rate):
+            generation_meta["fallback_reason"] = "claim_support_below_threshold"
+            return template_answer, generation_meta
+        if citation_coverage < float(self.config.generation.min_citation_coverage):
+            generation_meta["fallback_reason"] = "citation_coverage_below_threshold"
+            return template_answer, generation_meta
+
+        generation_meta["final_mode"] = "hybrid"
+        return rewritten, generation_meta
+
+    def _generation_abnormal_reason(self, search_trace: dict[str, Any]) -> str:
+        fts_recall = search_trace.get("fts_recall", [])
+        vec_recall = search_trace.get("vector_recall", [])
+        has_fts = isinstance(fts_recall, list) and bool(fts_recall)
+        has_vec = isinstance(vec_recall, list) and bool(vec_recall)
+
+        generation_trace = search_trace.get("generation", {})
+        if isinstance(generation_trace, dict):
+            if generation_trace.get("error"):
+                return "search_generation_error"
+            branch_errors = generation_trace.get("branch_errors", {})
+            selected_count = int(generation_trace.get("selected_count", 0) or 0)
+            if selected_count <= 0 and not (has_fts or has_vec):
+                return "no_retrieval_results"
+            if isinstance(branch_errors, dict) and branch_errors:
+                # Keep generation enabled when at least one retrieval branch is healthy.
+                if "vec" in branch_errors and not has_fts:
+                    return "vector_branch_error_no_lexical_backup"
+                if "fts" in branch_errors and not has_vec:
+                    return "fts_branch_error_no_vector_backup"
+
+        errors = search_trace.get("errors", [])
+        if isinstance(errors, list) and errors and not (has_fts or has_vec):
+            return "search_error"
+        return ""
+
+    def _hybrid_rewrite(self, *, draft: AnswerDraft, template_answer: str) -> str:
+        citation_sources = [
+            str(citation.get("source", "")).strip()
+            for citation in draft.citations
+            if str(citation.get("source", "")).strip()
+        ]
+        rewritten = self.generation_client.rewrite(
+            query=draft.query,
+            template_answer=template_answer,
+            steps=draft.steps,
+            evidence=draft.evidence,
+            citation_sources=citation_sources,
+        )
+        return rewritten.strip()
+
+    def _evaluate_answer_quality(self, answer: str, draft: AnswerDraft) -> tuple[float, list[str]]:
+        score = 1.0
+        issues: list[str] = []
+        required_sections = ["问题：", "建议执行步骤：", "参考来源："]
+        if draft.evidence:
+            required_sections.append("关键信息：")
+        missing_sections = [section for section in required_sections if section not in answer]
+        if missing_sections:
+            score -= 0.45
+            issues.append(f"missing_sections:{','.join(missing_sections)}")
+
+        step_count = len(re.findall(r"(?m)^\d+\.\s+", answer))
+        if step_count < min(3, len(draft.steps)):
+            score -= 0.2
+            issues.append("insufficient_step_count")
+
+        if len(answer.strip()) < 80:
+            score -= 0.2
+            issues.append("answer_too_short")
+
+        readability = self._readability_ratio(answer)
+        if readability < 0.65:
+            score -= 0.2
+            issues.append("low_readability")
+
+        lines = [line.strip() for line in answer.splitlines() if line.strip()]
+        if lines:
+            unique_ratio = len(set(lines)) / len(lines)
+            if unique_ratio < 0.65:
+                score -= 0.15
+                issues.append("high_repetition")
+
+        return max(0.0, min(1.0, score)), issues
+
+    def _estimate_claim_support(self, answer: str, evidence: list[str]) -> float:
+        if not evidence:
+            return 1.0
+        claims = self._split_claims(answer)
+        if not claims:
+            return 0.0
+        evidence_tokens = [self._text_tokens(line) for line in evidence if line.strip()]
+        if not evidence_tokens:
+            return 0.0
+
+        supported = 0
+        for claim in claims:
+            claim_tokens = self._text_tokens(claim)
+            if not claim_tokens:
+                continue
+            best = max((self._token_overlap(claim_tokens, row) for row in evidence_tokens), default=0.0)
+            if best >= 0.12:
+                supported += 1
+        return supported / max(len(claims), 1)
+
+    def _estimate_citation_coverage(self, answer: str, citations: list[dict[str, Any]]) -> float:
+        expected_sources = [
+            str(citation.get("source", "")).strip().lower()
+            for citation in citations
+            if str(citation.get("source", "")).strip()
+        ]
+        if not expected_sources:
+            return 1.0
+        lowered = answer.lower()
+        hit = sum(1 for source in expected_sources if source in lowered)
+        return hit / len(expected_sources)
+
+    def _readability_ratio(self, text: str) -> float:
+        if not text.strip():
+            return 0.0
+        readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）()《》“”‘’\- .:\n]", text)
+        return len(readable) / max(len(text), 1)
+
+    def _split_claims(self, answer: str) -> list[str]:
+        lines = []
+        in_reference = False
+        for raw in answer.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("参考来源："):
+                in_reference = True
+                continue
+            if in_reference:
+                continue
+            if line.endswith("：") and line in {"问题：", "建议执行步骤：", "关键信息："}:
+                continue
+            lines.append(line)
+
+        claims: list[str] = []
+        for line in lines:
+            parts = re.split(r"[。！？；\n]+", line)
+            for part in parts:
+                normalized = re.sub(r"\s+", " ", part).strip(" -\t")
+                if len(normalized) >= 8:
+                    claims.append(normalized)
+        return claims
+
+    def _text_tokens(self, text: str) -> set[str]:
+        lowered = text.lower()
+        latin_tokens = set(re.findall(r"[a-z0-9_]{2,}", lowered))
+        cjk_tokens = set(re.findall(r"[\u4e00-\u9fff]", lowered))
+        return latin_tokens | cjk_tokens
+
+    def _token_overlap(self, left: set[str], right: set[str]) -> float:
+        if not left:
+            return 0.0
+        return len(left & right) / len(left)
+
+    def _render_template_answer(self, draft: AnswerDraft) -> str:
+        lines = [f"问题：{draft.query}", "建议执行步骤："]
+        for idx, step in enumerate(draft.steps, start=1):
             lines.append(f"{idx}. {step}")
 
-        if evidence:
+        if draft.evidence:
             lines.append("关键信息：")
-            for sentence in evidence[:3]:
+            for sentence in draft.evidence[:3]:
                 lines.append(f"- {sentence}")
 
         lines.append("参考来源：")
-        for citation in self._build_citations(selected):
-            lines.append(f"- {citation['source']}")
+        for citation in draft.citations:
+            aliases = [str(alias) for alias in citation.get("aliases", []) if str(alias).strip()]
+            if aliases:
+                lines.append(f"- {citation['source']} (备选版本: {'; '.join(aliases)})")
+            else:
+                lines.append(f"- {citation['source']}")
         return "\n".join(lines)
+
+    def _build_human_answer(self, *, query: str, selected: list[Any]) -> str:
+        citations = self._build_citations(selected)
+        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        return self._render_template_answer(draft)
 
     def _detect_theme(self, query: str, selected: list[Any]) -> str:
         query_text = query.lower()

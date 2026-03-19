@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from src.RAG.classification.classifier import Classifier
 from src.RAG.config.kbase_config import KBaseConfig
@@ -19,8 +19,30 @@ class ParsedDocument:
     path: Path
     content: str
     doc_type: str
+    parse_metadata: dict[str, Any]
     file_hash: str
     file_size: int
+
+
+class BuilderSummary(TypedDict):
+    processed: int
+    updated: int
+    skipped: int
+    failed: int
+    errors: list[str]
+    indexed_files: int
+    indexed_chunks: int
+    partial_files: int
+    chunks_dropped_total: int
+    pdf_observability: list[dict[str, Any]]
+
+
+class IndexResult(TypedDict):
+    chunks_written: int
+    vectors_written: int
+    chunks_dropped: int
+    index_status: str
+    last_error: str | None
 
 
 class KnowledgeBaseBuilder:
@@ -47,10 +69,12 @@ class KnowledgeBaseBuilder:
                     "indexed_files": 0,
                     "indexed_chunks": 0,
                     "partial_files": 0,
+                    "chunks_dropped_total": 0,
+                    "pdf_observability": [],
                 }
             )
 
-        summary = {
+        summary: BuilderSummary = {
             "processed": 0,
             "updated": 0,
             "skipped": 0,
@@ -59,6 +83,8 @@ class KnowledgeBaseBuilder:
             "indexed_files": 0,
             "indexed_chunks": 0,
             "partial_files": 0,
+            "chunks_dropped_total": 0,
+            "pdf_observability": [],
         }
         for file_path in files:
             summary["processed"] += 1
@@ -81,30 +107,52 @@ class KnowledgeBaseBuilder:
                 if self.config.auto_classification:
                     category, confidence = self.classifier.classify(parsed.content[:6000])
                 summary_text = self._summarize(parsed.content)
+                parse_method = str(parsed.parse_metadata.get("parse_method", "ready"))
+                parse_readability = float(parsed.parse_metadata.get("readability_score", 1.0))
+                parse_noise = float(parsed.parse_metadata.get("noise_ratio", 0.0))
+                summary_with_quality = (
+                    f"{summary_text} (cls_conf={confidence:.2f}; parse={parse_method}; "
+                    f"readability={parse_readability:.2f}; noise={parse_noise:.2f})"
+                )
 
                 self.file_mapper.save_file(
                     uuid=file_uuid,
                     filename=file_path.name,
                     filepath=str(file_path),
                     category=category,
-                    summary=f"{summary_text} (cls_conf={confidence:.2f})".strip(),
+                    summary=summary_with_quality.strip(),
                     file_hash=parsed.file_hash,
                     file_size=parsed.file_size,
                     doc_type=parsed.doc_type,
-                    parse_status="ready",
+                    parse_status=parse_method,
                     index_status="indexing",
                 )
 
-                index_result = self.indexer.index_document(
-                    file_uuid=file_uuid,
-                    content=parsed.content,
-                    source=file_path.name,
-                    source_path=str(file_path),
-                    section_title="",
-                    doc_type=parsed.doc_type,
+                index_result = cast(
+                    IndexResult,
+                    self.indexer.index_document(
+                        file_uuid=file_uuid,
+                        content=parsed.content,
+                        source=file_path.name,
+                        source_path=str(file_path),
+                        section_title="",
+                        doc_type=parsed.doc_type,
+                    ),
                 )
                 summary["updated"] += 1
-                summary["indexed_chunks"] += int(index_result["chunks_written"])
+                summary["indexed_chunks"] += index_result["chunks_written"]
+                summary["chunks_dropped_total"] += int(index_result.get("chunks_dropped", 0))
+                if parsed.doc_type == "pdf":
+                    summary["pdf_observability"].append(
+                        {
+                            "source": file_path.name,
+                            "parse_method": parse_method,
+                            "readability_score": round(parse_readability, 6),
+                            "noise_ratio": round(parse_noise, 6),
+                            "chunks_written": int(index_result.get("chunks_written", 0)),
+                            "chunks_dropped": int(index_result.get("chunks_dropped", 0)),
+                        }
+                    )
                 if str(index_result["index_status"]) == "partial":
                     summary["partial_files"] += 1
                 self.file_mapper.update_index_status(
@@ -129,6 +177,7 @@ class KnowledgeBaseBuilder:
             path=file_path,
             content=content,
             doc_type=str(metadata.get("type", "text")),
+            parse_metadata=metadata,
             file_hash=file_hash,
             file_size=file_size,
         )
@@ -143,7 +192,7 @@ class KnowledgeBaseBuilder:
             return compact
         return f"{compact[:max_chars].rstrip()}..."
 
-    def _finalize(self, summary: dict[str, Any]) -> dict[str, Any]:
+    def _finalize(self, summary: BuilderSummary) -> dict[str, Any]:
         stats = self.indexer.get_index_stats()
         summary["indexed_files"] = stats["indexed_files"]
         summary["indexed_chunks"] = stats["indexed_chunks"]
@@ -165,4 +214,4 @@ class KnowledgeBaseBuilder:
             partial_files=summary["partial_files"],
             last_error=last_error,
         )
-        return summary
+        return dict(summary)

@@ -18,6 +18,7 @@ class GatewayResult:
     success: bool
     message: str
     fallback_type: str | None = None
+    embedding_dialog: dict[str, Any] | None = None
 
 
 class FeishuEventService:
@@ -234,6 +235,7 @@ class FeishuEventService:
                 "success": True,
                 "message": "ignored_self_message",
                 "fallback_type": None,
+                "embedding_dialog": None,
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
@@ -256,6 +258,7 @@ class FeishuEventService:
             "reply_ok": reply_result.get("ok", False),
             "reply_error": reply_result.get("error", ""),
             "token_dialog": token_dialog if not token_dialog["ok"] else None,
+            "embedding_dialog": result.embedding_dialog,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -275,7 +278,7 @@ class FeishuEventService:
 
     def _process_query(self, query: str) -> GatewayResult:
         try:
-            response = self.agent.run_sync(query)
+            response = self.agent.run_sync(query, include_trace=True)
         except TimeoutError:
             return GatewayResult(
                 success=False,
@@ -288,6 +291,7 @@ class FeishuEventService:
                 message=self._fallback_message("error"),
                 fallback_type="error",
             )
+        embedding_dialog = self._embedding_dialog_from_trace(response.trace)
 
         output_guardrail = self.config.guardrails.output
         if (
@@ -298,9 +302,14 @@ class FeishuEventService:
                 success=False,
                 message=self._fallback_message("no_rag_hit"),
                 fallback_type="no_rag_hit",
+                embedding_dialog=embedding_dialog,
             )
 
-        return GatewayResult(success=True, message=response.answer)
+        return GatewayResult(
+            success=True,
+            message=response.answer,
+            embedding_dialog=embedding_dialog,
+        )
 
     def _reply_to_event(self, *, event_data: dict[str, Any], text: str) -> dict[str, Any]:
         event = self._extract_event(event_data)
@@ -351,7 +360,10 @@ class FeishuEventService:
                 return True
 
             if len(self._processed_event_keys) >= self._dedup_max_entries:
-                oldest_key = min(self._processed_event_keys, key=self._processed_event_keys.get)
+                oldest_key = min(
+                    self._processed_event_keys,
+                    key=lambda key: self._processed_event_keys[key],
+                )
                 self._processed_event_keys.pop(oldest_key, None)
 
             self._processed_event_keys[dedup_key] = now
@@ -387,6 +399,37 @@ class FeishuEventService:
             "error": "temporary internal error",
         }
         return fallback_map.get(reason, fallback_map["error"])
+
+    @staticmethod
+    def _embedding_dialog_from_trace(trace: dict[str, Any]) -> dict[str, Any] | None:
+        search_trace = trace.get("search", {}) if isinstance(trace, dict) else {}
+        generation_trace = (
+            search_trace.get("generation", {}) if isinstance(search_trace, dict) else {}
+        )
+        branch_errors = (
+            generation_trace.get("branch_errors", {})
+            if isinstance(generation_trace, dict)
+            else {}
+        )
+        vec_error = str(branch_errors.get("vec", "")).strip() if isinstance(branch_errors, dict) else ""
+        if not vec_error:
+            return None
+
+        lowered = vec_error.lower()
+        is_embedding_failure = (
+            "remote embedding failed" in lowered
+            or "embedding model mismatch" in lowered
+            or "embedding dimension mismatch" in lowered
+        )
+        if not is_embedding_failure:
+            return None
+
+        return {
+            "ok": False,
+            "reason": "embedding_unavailable",
+            "message": "embedding 调用失败，请检查 ECBOT_EMBEDDING_API_KEY / ECBOT_EMBEDDING_MODEL。",
+            "detail": vec_error,
+        }
 
     @staticmethod
     def _is_placeholder(value: str) -> bool:

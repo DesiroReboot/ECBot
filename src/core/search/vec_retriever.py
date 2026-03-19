@@ -57,6 +57,7 @@ class VecRetriever:
                 section_expr = "NULL"
                 doc_type_expr = "NULL"
                 content_expr = "NULL"
+                doc_chunk_count_expr = "1"
                 if has_chunks:
                     joins.append(
                         """
@@ -65,11 +66,21 @@ class VecRetriever:
                            AND chunks.chunk_id = vec_index.chunk_id
                         """
                     )
+                    joins.append(
+                        """
+                        LEFT JOIN (
+                            SELECT file_uuid, COUNT(*) AS doc_chunk_count
+                            FROM chunks
+                            GROUP BY file_uuid
+                        ) chunk_stats ON chunk_stats.file_uuid = vec_index.file_uuid
+                        """
+                    )
                     source_expr = "chunks.source_filename"
                     source_path_expr = "chunks.source_path"
                     section_expr = "chunks.section_title"
                     doc_type_expr = "chunks.doc_type"
                     content_expr = "chunks.content"
+                    doc_chunk_count_expr = "COALESCE(chunk_stats.doc_chunk_count, 1)"
                 if "source" in vec_columns:
                     source_expr = f"COALESCE({source_expr}, vec_index.source)"
                 if "files" in tables:
@@ -97,6 +108,7 @@ class VecRetriever:
                         {source_path_expr} AS source_path,
                         {section_expr} AS section_title,
                         {doc_type_expr} AS doc_type,
+                        {doc_chunk_count_expr} AS doc_chunk_count,
                         {content_expr} AS content,
                         vec_index.embedding AS embedding
                     FROM vec_index
@@ -120,6 +132,7 @@ class VecRetriever:
                     "source_path": row["source_path"],
                     "section_title": row["section_title"],
                     "doc_type": row["doc_type"],
+                    "doc_chunk_count": int(row["doc_chunk_count"]),
                     "content": row["content"],
                     "vec_similarity": float(similarity),
                 }

@@ -84,10 +84,30 @@ class EmbeddingConfig:
 
 
 @dataclass
+class GenerationConfig:
+    mode: str = "hybrid"
+    provider: str = "dashscope"
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: str = ""
+    model: str = "qwen-plus"
+    temperature: float = 0.2
+    timeout: int = 25
+    max_retries: int = 2
+    min_quality_score: float = 0.55
+    min_claim_support_rate: float = 0.35
+    min_citation_coverage: float = 0.6
+
+
+@dataclass
 class KnowledgeBaseConfig:
     source_dir: str = r"E:\DATA\外贸电商知识库"
     supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf")
     auto_sync_on_startup: bool = False
+    ocr_enabled: bool = True
+    ocr_language: str = "chi_sim+eng"
+    ocr_dpi_scale: float = 2.0
+    ocr_trigger_readability: float = 0.58
+    min_chunk_readability: float = 0.38
     chunk_size: int = 400
     chunk_overlap: int = 80
     build_version: str = "rag-v2"
@@ -155,6 +175,7 @@ class Config:
         search_data = data.get("search", {})
         db_data = data.get("database", {})
         embedding_data = data.get("embedding", {})
+        generation_data = data.get("generation", {})
         knowledge_base_data = data.get("knowledge_base", {})
         gateway_data = data.get("gateway", {}).get("feishu", {})
         output_guardrail_data = data.get("guardrails", {}).get("output", {})
@@ -180,6 +201,44 @@ class Config:
             timeout=int(_env("ECBOT_EMBEDDING_TIMEOUT", embedding_data.get("timeout", 20))),
             max_retries=int(_env("ECBOT_EMBEDDING_MAX_RETRIES", embedding_data.get("max_retries", 3))),
         )
+        self.generation = GenerationConfig(
+            mode=str(_env("ECBOT_GENERATION_MODE", generation_data.get("mode", "hybrid"))).strip().lower(),
+            provider=str(_env("ECBOT_GENERATION_PROVIDER", generation_data.get("provider", "dashscope"))),
+            base_url=str(
+                _env(
+                    "ECBOT_GENERATION_BASE_URL",
+                    generation_data.get("base_url", embedding_data.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")),
+                )
+            ),
+            api_key=str(
+                _env(
+                    "ECBOT_GENERATION_API_KEY",
+                    generation_data.get("api_key", embedding_data.get("api_key", "")),
+                )
+            ),
+            model=str(_env("ECBOT_GENERATION_MODEL", generation_data.get("model", "qwen-plus"))),
+            temperature=float(_env("ECBOT_GENERATION_TEMPERATURE", generation_data.get("temperature", 0.2))),
+            timeout=int(_env("ECBOT_GENERATION_TIMEOUT", generation_data.get("timeout", 25))),
+            max_retries=int(_env("ECBOT_GENERATION_MAX_RETRIES", generation_data.get("max_retries", 2))),
+            min_quality_score=float(
+                _env(
+                    "ECBOT_GENERATION_MIN_QUALITY_SCORE",
+                    generation_data.get("min_quality_score", 0.55),
+                )
+            ),
+            min_claim_support_rate=float(
+                _env(
+                    "ECBOT_GENERATION_MIN_CLAIM_SUPPORT_RATE",
+                    generation_data.get("min_claim_support_rate", 0.35),
+                )
+            ),
+            min_citation_coverage=float(
+                _env(
+                    "ECBOT_GENERATION_MIN_CITATION_COVERAGE",
+                    generation_data.get("min_citation_coverage", 0.6),
+                )
+            ),
+        )
         self.knowledge_base = KnowledgeBaseConfig(
             source_dir=str(_env("ECBOT_KB_SOURCE_DIR", knowledge_base_data.get("source_dir", r"E:\DATA\外贸电商知识库"))),
             supported_extensions=_as_tuple(
@@ -189,6 +248,28 @@ class Config:
             auto_sync_on_startup=_as_bool(
                 _env("ECBOT_KB_AUTO_SYNC", knowledge_base_data.get("auto_sync_on_startup", False)),
                 False,
+            ),
+            ocr_enabled=_as_bool(
+                _env("ECBOT_KB_OCR_ENABLED", knowledge_base_data.get("ocr_enabled", True)),
+                True,
+            ),
+            ocr_language=str(
+                _env("ECBOT_KB_OCR_LANGUAGE", knowledge_base_data.get("ocr_language", "chi_sim+eng"))
+            ),
+            ocr_dpi_scale=float(
+                _env("ECBOT_KB_OCR_DPI_SCALE", knowledge_base_data.get("ocr_dpi_scale", 2.0))
+            ),
+            ocr_trigger_readability=float(
+                _env(
+                    "ECBOT_KB_OCR_TRIGGER_READABILITY",
+                    knowledge_base_data.get("ocr_trigger_readability", 0.58),
+                )
+            ),
+            min_chunk_readability=float(
+                _env(
+                    "ECBOT_KB_MIN_CHUNK_READABILITY",
+                    knowledge_base_data.get("min_chunk_readability", 0.38),
+                )
             ),
             chunk_size=int(_env("ECBOT_CHUNK_SIZE", knowledge_base_data.get("chunk_size", 400))),
             chunk_overlap=int(_env("ECBOT_CHUNK_OVERLAP", knowledge_base_data.get("chunk_overlap", 80))),

@@ -61,7 +61,7 @@ def run_long_connection_client(config: Config | None = None) -> None:
     service = FeishuEventService(cfg)
 
     try:
-        import lark_oapi as lark
+        import lark_oapi as lark  # type: ignore[import-untyped]
     except Exception as exc:
         raise RuntimeError("lark_oapi is required for long_connection mode") from exc
 

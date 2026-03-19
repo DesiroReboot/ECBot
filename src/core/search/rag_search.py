@@ -88,6 +88,7 @@ class RAGSearcher:
             fused = self.fusion.fuse(fts_results, vec_results)
             candidates, source_scores = self.grader.grade(
                 query_tokens=list(preprocess["tokens"]),
+                query_theme_hints=list(preprocess.get("theme_hints", [])),
                 fused_results=fused,
             )
             selected, citations = self.context_selector.select(
@@ -153,6 +154,9 @@ class RAGSearcher:
                         "file_uuid": item.file_uuid,
                         "chunk_id": item.chunk_id,
                         "source": item.source,
+                        "source_path": item.source_path,
+                        "section_title": item.section_title,
+                        "content": item.content,
                         "score": item.score,
                         "grading": item.grading,
                     }
@@ -224,6 +228,9 @@ class RAGSearcher:
                     "file_uuid": item.file_uuid,
                     "chunk_id": item.chunk_id,
                     "source": item.source,
+                    "source_path": item.source_path,
+                    "section_title": item.section_title,
+                    "content": item.content,
                     "score": item.score,
                     "grading": item.grading,
                 }
@@ -279,6 +286,7 @@ class RAGSearcher:
 
         selected_by_source: dict[str, int] = {}
         selected_content: set[str] = set()
+        source_quotas = getattr(self.context_selector, "last_source_quotas", {})
         for item in selected_results:
             source = str(item.get("source", ""))
             selected_by_source[source] = selected_by_source.get(source, 0) + 1
@@ -292,8 +300,8 @@ class RAGSearcher:
             source = str(item.get("source", ""))
             content_key = str(item.get("content", "")).strip()
             reason = "score_or_source_priority"
-            if selected_by_source.get(source, 0) >= 2:
-                reason = "per_source_cap_reached"
+            if selected_by_source.get(source, 0) >= int(source_quotas.get(source, 1)):
+                reason = "source_soft_quota_reached"
             elif content_key in selected_content:
                 reason = "duplicate_content"
             elif len(selected_results) >= self.context_top_k:
@@ -320,6 +328,7 @@ class RAGSearcher:
                 "fused_total": len(fused_results),
                 "selected_total": len(selected_results),
                 "eliminated_total": len(eliminated_candidates),
+                "source_quotas": source_quotas,
             },
             "branch_contribution": branch_contribution,
             "eliminated_candidates": eliminated_candidates,

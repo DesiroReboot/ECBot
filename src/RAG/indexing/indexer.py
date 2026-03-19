@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 from typing import Any
 
@@ -33,7 +34,8 @@ class Indexer:
         section_title: str = "",
         doc_type: str = "text",
     ) -> dict[str, Any]:
-        chunks = self._chunk_content(content)
+        raw_chunks = self._chunk_content(content)
+        chunks, chunks_dropped = self._filter_chunks_by_quality(raw_chunks, doc_type=doc_type)
         embeddings: list[list[float]] | None = None
         embedding_error: str | None = None
         if chunks:
@@ -107,11 +109,18 @@ class Indexer:
                             (file_uuid, chunk_id, self.embedding.serialize(vec)),
                         )
 
+        if not chunks:
+            status = "partial"
+            final_error = embedding_error or "all_chunks_dropped_by_readability"
+        else:
+            status = "ready" if embeddings is not None else "partial"
+            final_error = embedding_error
         return {
             "chunks_written": len(chunks),
             "vectors_written": len(chunks) if embeddings is not None else 0,
-            "index_status": "ready" if embeddings is not None else "partial",
-            "last_error": embedding_error,
+            "chunks_dropped": chunks_dropped,
+            "index_status": status,
+            "last_error": final_error,
         }
 
     def delete_document_index(self, file_uuid: str) -> None:
@@ -191,3 +200,39 @@ class Indexer:
             return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
         except sqlite3.OperationalError:
             return 0
+
+    def _filter_chunks_by_quality(
+        self,
+        chunks: list[str],
+        *,
+        doc_type: str,
+    ) -> tuple[list[str], int]:
+        if not chunks:
+            return [], 0
+        min_readability = max(0.0, min(1.0, float(self.config.min_chunk_readability)))
+        filtered: list[str] = []
+        dropped = 0
+        for chunk in chunks:
+            readability = self._readability_score(chunk)
+            if str(doc_type).lower() == "pdf" and readability < min_readability:
+                dropped += 1
+                continue
+            filtered.append(chunk)
+        return filtered, dropped
+
+    def _readability_score(self, text: str) -> float:
+        if not text.strip():
+            return 0.0
+        readable = re.findall(
+            r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、“”‘’（）()、,.!?;:\-_/ ]",
+            text,
+        )
+        readable_ratio = len(readable) / max(len(text), 1)
+        lowered = text.lower()
+        noise_hits = sum(
+            lowered.count(marker)
+            for marker in ("stream", "xref", "endobj", "/filter", "/length", "obj", "flatedecode")
+        )
+        noise_ratio = min(1.0, noise_hits / max(len(text) / 80.0, 1.0))
+        score = 0.75 * readable_ratio + 0.25 * (1.0 - noise_ratio)
+        return max(0.0, min(1.0, score))
