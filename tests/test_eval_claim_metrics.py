@@ -52,3 +52,33 @@ def test_citation_validity_accepts_alias_versions() -> None:
 
     assert strict_hit is True
     assert relaxed_hit is True
+
+
+def test_generation_quality_metrics_with_constraints() -> None:
+    checker = EvalChecker.__new__(EvalChecker)
+    answer = "步骤一：先做市场调研。步骤二：再做小批量测试。注意风险与成本。"
+    citations = [{"source": "market.pdf", "title": "market.pdf"}]
+    rubric = {"must_have_sections": ["步骤", "风险"], "citation_required": True}
+
+    answer_completeness = checker.calculate_answer_completeness(
+        answer=answer,
+        must_keyword_coverage=0.5,
+        rubric=rubric,
+    )
+    instruction_following_rate = checker.calculate_instruction_following_rate(
+        answer=answer,
+        citations=citations,
+        rubric=rubric,
+        forbidden_claims=["保证盈利"],
+    )
+    actionability_score = checker.calculate_actionability_score(answer)
+    generation_quality_score = checker.calculate_generation_quality_score(
+        answer_completeness=answer_completeness,
+        instruction_following_rate=instruction_following_rate,
+        actionability_score=actionability_score,
+    )
+
+    assert answer_completeness > 0.5
+    assert instruction_following_rate == 1.0
+    assert actionability_score > 0.0
+    assert generation_quality_score > 0.0

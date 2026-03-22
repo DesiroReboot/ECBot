@@ -6,6 +6,8 @@ from typing import Any
 
 from src.config import Config
 from src.core.generation import GenerationClient
+from src.core.search.orchestrator import SearchOrchestrator
+from src.core.search.planner import RulePlanner
 from src.core.search.rag_search import RAGSearcher
 from src.core.search.source_utils import build_grouped_citations
 from src.RAG.config.kbase_config import KBaseConfig
@@ -65,7 +67,7 @@ class ReActAgent:
             build_version=config.knowledge_base.build_version,
         )
         self.manifest_store = ManifestStore(config.database.db_path, ensure_schema=False)
-        self.searcher = RAGSearcher(
+        self.rag_searcher = RAGSearcher(
             db_path=config.database.db_path,
             top_k=self.answer_top_k,
             fts_top_k=config.search.fts_top_k,
@@ -81,9 +83,20 @@ class ReActAgent:
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
         )
+        self.planner = RulePlanner()
+        self.search_orchestrator = SearchOrchestrator(
+            planner=self.planner,
+            rag_searcher=self.rag_searcher,
+            web_searcher=None,  # Reserved interface only. Web execution stays disabled.
+            config=config,
+        )
+        # Backward-compatible alias for any legacy direct access.
+        self.searcher = self.rag_searcher
 
     def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
-        results, search_trace = self.searcher.search_with_trace(query)
+        orchestrator_result = self.search_orchestrator.search_with_trace(query)
+        results = orchestrator_result.hits
+        search_trace = orchestrator_result.trace_search
         manifest = self.manifest_store.get_manifest()
         trace: dict[str, Any] = {
             "query": query,
@@ -116,7 +129,7 @@ class ReActAgent:
             )
 
         selected = results[: self.answer_top_k]
-        citations = self._build_citations(selected)
+        citations = orchestrator_result.citations or self._build_citations(selected)
         draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
         template_answer = self._render_template_answer(draft)
         answer, generation_meta = self._compose_answer(
@@ -124,9 +137,9 @@ class ReActAgent:
             template_answer=template_answer,
             search_trace=search_trace,
         )
-        confidence = min(
-            1.0,
-            sum(max(0.0, item.score) for item in selected) / max(len(selected), 1),
+        confidence = max(
+            float(orchestrator_result.retrieval_confidence),
+            min(1.0, sum(max(0.0, item.score) for item in selected) / max(len(selected), 1)),
         )
 
         trace["strategy_execution"].append(
@@ -237,6 +250,8 @@ class ReActAgent:
         vec_recall = search_trace.get("vector_recall", [])
         has_fts = isinstance(fts_recall, list) and bool(fts_recall)
         has_vec = isinstance(vec_recall, list) and bool(vec_recall)
+        if "fts_recall" in search_trace and not has_fts and not has_vec:
+            return "fts_no_hit"
 
         generation_trace = search_trace.get("generation", {})
         if isinstance(generation_trace, dict):

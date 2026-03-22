@@ -6,7 +6,6 @@ logs/
 scripts/
 Eval/
 Doc/*
-!Doc/RAG.md
 src/__pycache__
 .env
 .env.local

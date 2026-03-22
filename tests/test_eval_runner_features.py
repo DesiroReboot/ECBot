@@ -103,3 +103,65 @@ def test_write_report_artifacts_writes_versioned_manifest() -> None:
     finally:
         if test_root.exists():
             shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_calculate_summary_includes_generation_quality_metrics() -> None:
+    checker = EvalChecker.__new__(EvalChecker)
+    results = [
+        EvalResult(
+            id="001",
+            question="q1",
+            scenario="s",
+            difficulty="medium",
+            source_of_question="real",
+            answer="a1",
+            must_source_recall=1.0,
+            source_precision=1.0,
+            must_keyword_coverage=0.8,
+            should_keyword_coverage=0.8,
+            keyword_score=0.8,
+            strict_citation_hit=True,
+            relaxed_citation_hit=True,
+            claim_supported_rate=0.9,
+            claim_citation_precision=0.8,
+            hallucination_rate=0.1,
+            answer_completeness=0.7,
+            instruction_following_rate=1.0,
+            actionability_score=0.8,
+            generation_quality_score=0.8333,
+            pass_rate_at_n=1.0,
+            failure_path={"status": "passed", "quality_gate_fail_reasons": []},
+        ),
+        EvalResult(
+            id="002",
+            question="q2",
+            scenario="s",
+            difficulty="medium",
+            source_of_question="real",
+            answer="a2",
+            must_source_recall=0.5,
+            source_precision=0.5,
+            must_keyword_coverage=0.6,
+            should_keyword_coverage=0.6,
+            keyword_score=0.6,
+            strict_citation_hit=False,
+            relaxed_citation_hit=True,
+            claim_supported_rate=0.7,
+            claim_citation_precision=0.6,
+            hallucination_rate=0.3,
+            answer_completeness=0.5,
+            instruction_following_rate=0.5,
+            actionability_score=0.4,
+            generation_quality_score=0.4667,
+            pass_rate_at_n=0.0,
+            failure_path={"status": "degraded", "quality_gate_fail_reasons": []},
+        ),
+    ]
+
+    summary = checker._calculate_summary(results, repeat_runs=2)
+
+    assert summary.answer_completeness_avg == 0.6
+    assert summary.instruction_following_rate_avg == 0.75
+    assert summary.actionability_score_avg == 0.6
+    assert summary.generation_quality_score_avg == 0.65
+    assert 0.0 <= summary.overall_score_v2 <= 1.0
