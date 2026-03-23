@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
@@ -120,6 +121,9 @@ def test_self_check_and_fullchain_visualize(tmp_path: Path) -> None:
     self_payload = self_check.json()
     assert self_payload["summary"]["total"] >= 1
     assert isinstance(self_payload["checks"], list)
+    self_check_ts = datetime.fromisoformat(self_payload["timestamp"])
+    assert self_check_ts.tzinfo is not None
+    assert self_check_ts.utcoffset() == timedelta(0)
 
     fullchain = client.post("/gateway/fullchain-visualize", json={"query": "hello"})
     assert fullchain.status_code == 200
@@ -127,6 +131,9 @@ def test_self_check_and_fullchain_visualize(tmp_path: Path) -> None:
     assert chain_payload["ok"] is True
     assert chain_payload["query"] == "hello"
     assert isinstance(chain_payload["stages"], list)
+    fullchain_ts = datetime.fromisoformat(chain_payload["timestamp"])
+    assert fullchain_ts.tzinfo is not None
+    assert fullchain_ts.utcoffset() == timedelta(0)
 
 
 def test_url_verification_token_check(tmp_path: Path) -> None:

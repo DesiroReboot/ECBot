@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 from threading import Lock
 import time
@@ -89,7 +89,7 @@ class FeishuEventService:
             "ok": ok_count == len(checks),
             "summary": {"passed": ok_count, "total": len(checks)},
             "checks": checks,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     def visualize_fullchain(self, query: str) -> dict[str, Any]:
@@ -119,7 +119,7 @@ class FeishuEventService:
                 "query": "",
                 "trace": {},
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
         stages.append(
@@ -173,7 +173,7 @@ class FeishuEventService:
             "stages": stages,
             "trace": trace,
             "duration_ms": int((time.perf_counter() - started_at) * 1000),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     def handle_event(
@@ -197,7 +197,7 @@ class FeishuEventService:
                 "success": False,
                 "message": self._fallback_message("signature_invalid"),
                 "fallback_type": "signature_invalid",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
         event_type = event_data.get("type")
@@ -210,7 +210,7 @@ class FeishuEventService:
                     "success": False,
                     "message": self._fallback_message("verification_token_invalid"),
                     "fallback_type": "verification_token_invalid",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
             return {"challenge": event_data.get("challenge", "")}
 
@@ -227,7 +227,7 @@ class FeishuEventService:
                 "reply_error": "",
                 "token_dialog": None,
                 "duplicate": True,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
         if self._is_bot_message(event_data):
@@ -236,7 +236,7 @@ class FeishuEventService:
                 "message": "ignored_self_message",
                 "fallback_type": None,
                 "embedding_dialog": None,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
 
         query = self._extract_query(event_data)
@@ -259,7 +259,7 @@ class FeishuEventService:
             "reply_error": reply_result.get("error", ""),
             "token_dialog": token_dialog if not token_dialog["ok"] else None,
             "embedding_dialog": result.embedding_dialog,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
     def _extract_query(self, event_data: dict[str, Any]) -> str:

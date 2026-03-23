@@ -2,9 +2,10 @@
 
 import os
 import sys
-import tempfile
 import shutil
+import time
 import unittest
+import uuid
 
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -17,6 +18,34 @@ from RAG.classification.classifier import Classifier
 from RAG.indexing.indexer import Indexer
 from RAG.preprocessing.parser import DocumentParser
 
+
+def _mktemp_dir() -> str:
+    override_root = str(os.environ.get('ECBOT_TEST_TMPDIR', '')).strip()
+    base_root = override_root or os.path.join(os.getcwd(), 'pytest_tmp_kbase')
+    os.makedirs(base_root, exist_ok=True)
+    for _ in range(16):
+        path = os.path.join(base_root, f"tmp_{uuid.uuid4().hex}")
+        try:
+            os.mkdir(path)
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError('failed_to_allocate_temp_dir')
+
+
+def _cleanup_temp_dir(path: str, retries: int = 10, base_delay_sec: float = 0.1) -> None:
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt >= retries - 1:
+                # Best-effort cleanup for transient Windows file locks.
+                shutil.rmtree(path, ignore_errors=True)
+                return
+            time.sleep(base_delay_sec * (attempt + 1))
 
 class TestKBaseConfig(unittest.TestCase):
     """测试配置模块"""
@@ -38,7 +67,7 @@ class TestKBaseManager(unittest.TestCase):
     """测试知识库管理主控制器"""
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
         self.db_path = os.path.join(self.temp_dir, 'test.db')
         self.config = KBaseConfig(db_path=self.db_path)
         self.kbase = KBaseManager(self.config)
@@ -48,7 +77,7 @@ class TestKBaseManager(unittest.TestCase):
         os.makedirs(self.test_files_dir)
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_init_database(self):
         """测试数据库初始化"""
@@ -90,7 +119,7 @@ class TestFileMapper(unittest.TestCase):
     """测试文件映射管理器"""
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
         self.db_path = os.path.join(self.temp_dir, 'test.db')
         # 初始化数据库
         import sqlite3
@@ -115,7 +144,7 @@ class TestFileMapper(unittest.TestCase):
         self.mapper = FileMapper(self.db_path)
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_save_and_get_file(self):
         """测试保存和获取文件"""
@@ -189,7 +218,7 @@ class TestConflictResolver(unittest.TestCase):
     """测试冲突解决器"""
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
         self.db_path = os.path.join(self.temp_dir, 'test.db')
         # 初始化数据库
         import sqlite3
@@ -211,7 +240,7 @@ class TestConflictResolver(unittest.TestCase):
         self.resolver = ConflictResolver(self.db_path)
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_report_and_detect_conflicts(self):
         """测试报告和检测冲突"""
@@ -298,7 +327,7 @@ class TestIndexer(unittest.TestCase):
     """测试索引构建器"""
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
         self.db_path = os.path.join(self.temp_dir, 'test.db')
         self.config = KBaseConfig(db_path=self.db_path)
         # 初始化数据库
@@ -326,7 +355,7 @@ class TestIndexer(unittest.TestCase):
         self.indexer = Indexer(self.db_path, self.config)
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_index_document(self):
         """测试文档索引"""
@@ -371,10 +400,10 @@ class TestDocumentParser(unittest.TestCase):
     def setUp(self):
         self.config = KBaseConfig()
         self.parser = DocumentParser(self.config)
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_parse_text_file(self):
         """测试解析文本文件"""
@@ -415,7 +444,7 @@ class TestIntegration(unittest.TestCase):
     """集成测试"""
 
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
+        self.temp_dir = _mktemp_dir()
         self.db_path = os.path.join(self.temp_dir, 'test.db')
         self.config = KBaseConfig(db_path=self.db_path)
         self.kbase = KBaseManager(self.config)
@@ -433,7 +462,7 @@ class TestIntegration(unittest.TestCase):
             f.write('Amazon FBA business guide covering listing optimization, PPC advertising, and Shopify integration for dropshipping.')
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        _cleanup_temp_dir(self.temp_dir)
 
     def test_full_workflow(self):
         """测试完整工作流"""

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from urllib import error, request
+from urllib import request
 
 
 def _mode() -> str:

@@ -109,6 +109,7 @@ class Indexer:
                             (file_uuid, chunk_id, self.embedding.serialize(vec)),
                         )
 
+        final_error: str | None
         if not chunks:
             status = "partial"
             final_error = embedding_error or "all_chunks_dropped_by_readability"

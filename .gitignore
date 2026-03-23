@@ -12,3 +12,25 @@ src/__pycache__
 .env.*.local
 src/**/**/__pycache__
 tests/**/**/__pycache__
+
+# Databases / local state
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Temp and test artifacts
+.pytest_cache/
+.pytest_tmp/
+.pytest_tmp*/
+pytest_tmp*/
+pytest_temp*/
+tmp_pytest*/
+tmp_test*/
+gw_manual_tmp/
+tmp/
+temp/
+*.tmp
+*.temp

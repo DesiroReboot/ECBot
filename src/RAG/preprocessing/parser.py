@@ -8,25 +8,37 @@ from typing import Any
 
 from src.RAG.config.kbase_config import KBaseConfig
 
+PdfReader: Any = None
 try:
-    from pypdf import PdfReader  # type: ignore[import-untyped]
+    from pypdf import PdfReader as _ImportedPdfReader  # type: ignore[import-untyped]
 except Exception:  # pragma: no cover - optional dependency.
-    PdfReader = None
+    pass
+else:
+    PdfReader = _ImportedPdfReader
 
+fitz: Any = None
 try:
-    import fitz  # type: ignore[import-untyped]
+    import fitz as _imported_fitz  # type: ignore[import-untyped]
 except Exception:  # pragma: no cover - optional dependency.
-    fitz = None
+    pass
+else:
+    fitz = _imported_fitz
 
+Image: Any = None
 try:
-    from PIL import Image
+    from PIL import Image as _ImportedPILImage
 except Exception:  # pragma: no cover - optional dependency.
-    Image = None
+    pass
+else:
+    Image = _ImportedPILImage
 
+pytesseract: Any = None
 try:
-    import pytesseract  # type: ignore[import-untyped]
+    import pytesseract as _imported_pytesseract  # type: ignore[import-untyped]
 except Exception:  # pragma: no cover - optional dependency.
-    pytesseract = None
+    pass
+else:
+    pytesseract = _imported_pytesseract
 
 
 class DocumentParser:
@@ -156,7 +168,7 @@ class DocumentParser:
             with fitz.open(str(file_path)) as doc:
                 for page in doc:
                     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-                    image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                     text = pytesseract.image_to_string(image, lang=lang)
                     if text.strip():
                         texts.append(text)
