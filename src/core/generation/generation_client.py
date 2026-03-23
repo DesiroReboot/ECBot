@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from time import sleep
-from urllib import request
+from urllib import parse, request
 
 from src.config import GenerationConfig
 
@@ -56,7 +56,7 @@ class GenerationClient:
             "请输出最终答案。请勿包含多余说明。"
         )
 
-        url = f"{self.base_url}/chat/completions"
+        url = self._safe_http_url(f"{self.base_url}/chat/completions")
         payload = json.dumps(
             {
                 "model": self.model,
@@ -80,7 +80,7 @@ class GenerationClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                with request.urlopen(req, timeout=self.timeout) as response:
+                with request.urlopen(req, timeout=self.timeout) as response:  # nosec B310
                     body = response.read().decode("utf-8", errors="ignore")
                 data = json.loads(body)
                 content = self._extract_content(data)
@@ -94,6 +94,14 @@ class GenerationClient:
                     continue
                 break
         raise RuntimeError(f"generation rewrite failed: {last_error}")
+
+    def _safe_http_url(self, raw_url: str) -> str:
+        parsed = parse.urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError(f"unsupported url scheme: {parsed.scheme!r}")
+        if not parsed.netloc:
+            raise ValueError("missing url host")
+        return raw_url
 
     def _extract_content(self, payload: dict) -> str:
         choices = payload.get("choices", [])

@@ -171,7 +171,7 @@ class KnowledgeBaseBuilder:
         if not content.strip():
             content = file_path.name
         raw = file_path.read_bytes() if file_path.exists() else content.encode("utf-8")
-        file_hash = hashlib.sha1(raw).hexdigest()
+        file_hash = hashlib.sha256(raw).hexdigest()
         file_size = len(raw)
         return ParsedDocument(
             path=file_path,
@@ -184,7 +184,7 @@ class KnowledgeBaseBuilder:
 
     def _stable_doc_uuid(self, file_path: str) -> str:
         normalized = file_path.replace("\\", "/").strip().lower()
-        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def _summarize(self, content: str, max_chars: int = 140) -> str:
         compact = " ".join(content.strip().split())

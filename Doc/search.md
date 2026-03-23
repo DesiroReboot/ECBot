@@ -164,7 +164,7 @@ flowchart TD
 
 不破坏现有 `AgentResponse` 与 `visualize_fullchain` 主结构，只追加：
 - `trace.search.web.need_web_search`
-- `trace.search.web.route` (`none/direct_fusion/rag_fusion`)
+- `trace.search.web.fusion_strategy` (`none/direct_fusion/rag_fusion`)
 - `trace.search.web.reasons`
 - `trace.search.web.metrics`
 - `trace.search.web.fallback`
@@ -206,7 +206,7 @@ flowchart TD
 - 失败回退本地RAG
 
 3. `tests/test_bot_generation_mode.py` 扩展
-- 覆盖 `trace.search.web.route` 与 fallback 行为
+- 覆盖 `trace.search.web.fusion_strategy` 与 fallback 行为
 
 ---
 
@@ -216,4 +216,3 @@ flowchart TD
 2. 路由决策可解释（trace 有明确 reasons + metrics）
 3. 不破坏现有网关与 RAG 回退能力
 4. 默认配置下行为与当前版本一致（兼容 `../ECBot` 合并）
-

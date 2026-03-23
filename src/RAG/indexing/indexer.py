@@ -22,7 +22,13 @@ class Indexer:
             ensure_schema(conn)
 
     def _chunk_content(self, content: str) -> list[str]:
-        return self.chunker.split(content)
+        chunks = self.chunker.split(content)
+        if len(chunks) > 1:
+            return chunks
+        if len(content) <= self.config.chunk_size:
+            return chunks
+        step = max(1, self.config.chunk_size - self.config.chunk_overlap)
+        return [content[idx : idx + self.config.chunk_size] for idx in range(0, len(content), step)]
 
     def index_document(
         self,
@@ -46,9 +52,17 @@ class Indexer:
                 embedding_error = str(exc)
 
         with transaction(self.db_path) as conn:
+            self._ensure_file_row_tx(
+                conn=conn,
+                file_uuid=file_uuid,
+                source=source,
+                source_path=source_path,
+                doc_type=doc_type,
+                content=content,
+            )
             self._delete_document_index_tx(conn, file_uuid)
             for chunk_id, chunk_text in enumerate(chunks):
-                content_hash = hashlib.sha1(chunk_text.encode("utf-8")).hexdigest()
+                content_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
                 conn.execute(
                     """
                     INSERT INTO chunks (
@@ -138,16 +152,12 @@ class Indexer:
                 for row in conn.execute("PRAGMA table_info(fts_index)").fetchall()
             }
             has_source = "source" in fts_columns
-            source_expr = "fts_index.source" if has_source else "COALESCE(files.filename, '')"
-            rows = conn.execute(
-                """
+            if has_source:
+                sql = """
                 SELECT
                     fts_index.file_uuid AS file_uuid,
                     fts_index.chunk_id AS chunk_id,
-                    """
-                + source_expr
-                + """
-                    AS source,
+                    fts_index.source AS source,
                     COALESCE(files.filepath, '') AS source_path,
                     fts_index.content AS content,
                     bm25(fts_index) AS fts_raw_score
@@ -156,9 +166,23 @@ class Indexer:
                 WHERE fts_index MATCH ?
                 ORDER BY bm25(fts_index)
                 LIMIT ?
-                """,
-                (query, limit),
-            ).fetchall()
+                """
+            else:
+                sql = """
+                SELECT
+                    fts_index.file_uuid AS file_uuid,
+                    fts_index.chunk_id AS chunk_id,
+                    COALESCE(files.filename, '') AS source,
+                    COALESCE(files.filepath, '') AS source_path,
+                    fts_index.content AS content,
+                    bm25(fts_index) AS fts_raw_score
+                FROM fts_index
+                LEFT JOIN files ON files.uuid = fts_index.file_uuid
+                WHERE fts_index MATCH ?
+                ORDER BY bm25(fts_index)
+                LIMIT ?
+                """
+            rows = conn.execute(sql, (query, limit)).fetchall()
 
         results = []
         for rank, row in enumerate(rows, start=1):
@@ -196,9 +220,72 @@ class Indexer:
         except sqlite3.OperationalError:
             pass
 
-    def _safe_count(self, conn: sqlite3.Connection, table_name: str) -> int:
+    def _ensure_file_row_tx(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        file_uuid: str,
+        source: str,
+        source_path: str,
+        doc_type: str,
+        content: str,
+    ) -> None:
         try:
-            return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+            conn.execute(
+                """
+                INSERT INTO files (
+                    uuid, filename, filepath, category, summary, file_hash, file_size,
+                    doc_type, parse_status, index_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uuid) DO NOTHING
+                """,
+                (
+                    file_uuid,
+                    source or file_uuid,
+                    source_path or source or file_uuid,
+                    "uncategorized",
+                    (content or source or file_uuid)[:140],
+                    hashlib.sha256((source_path or source or file_uuid).encode("utf-8")).hexdigest(),
+                    len(content.encode("utf-8")),
+                    doc_type or "text",
+                    "ready",
+                    "indexing",
+                ),
+            )
+        except sqlite3.OperationalError:
+            # Legacy schema may not include full metadata columns.
+            conn.execute(
+                """
+                INSERT INTO files (
+                    uuid, filename, filepath, category, summary, file_hash, file_size
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uuid) DO NOTHING
+                """,
+                (
+                    file_uuid,
+                    source or file_uuid,
+                    source_path or source or file_uuid,
+                    "uncategorized",
+                    (content or source or file_uuid)[:140],
+                    hashlib.sha256((source_path or source or file_uuid).encode("utf-8")).hexdigest(),
+                    len(content.encode("utf-8")),
+                ),
+            )
+
+    def _safe_count(self, conn: sqlite3.Connection, table_name: str) -> int:
+        query_by_table = {
+            "files": "SELECT COUNT(*) FROM files",
+            "chunks": "SELECT COUNT(*) FROM chunks",
+            "fts_index": "SELECT COUNT(*) FROM fts_index",
+            "vec_index": "SELECT COUNT(*) FROM vec_index",
+        }
+        sql = query_by_table.get(table_name)
+        if not sql:
+            return 0
+        try:
+            return int(conn.execute(sql).fetchone()[0])
         except sqlite3.OperationalError:
             return 0
 

@@ -19,7 +19,11 @@ def run_webhook_server(config: Config | None = None) -> None:
     # Keep a single FastAPI runtime path while long_connection mode is deprecated.
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=cfg.gateway.feishu.webhook_port)
+    uvicorn.run(
+        app,
+        host=str(cfg.gateway.feishu.webhook_host or "127.0.0.1"),
+        port=cfg.gateway.feishu.webhook_port,
+    )
 
 
 def run_gateway(config: Config | None = None) -> None:

@@ -2,39 +2,68 @@ from __future__ import annotations
 
 from collections import Counter
 import math
+from types import ModuleType
 from pathlib import Path
 import re
 from typing import Any
 
 from src.RAG.config.kbase_config import KBaseConfig
 
+<<<<<<< HEAD
 PdfReader: Any = None
 try:
     from pypdf import PdfReader as _ImportedPdfReader  # type: ignore[import-untyped]
+=======
+PdfReader: Any
+try:
+    from pypdf import PdfReader as _PdfReader  # type: ignore[import-untyped]
+    PdfReader = _PdfReader
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 except Exception:  # pragma: no cover - optional dependency.
     pass
 else:
     PdfReader = _ImportedPdfReader
 
+<<<<<<< HEAD
 fitz: Any = None
 try:
     import fitz as _imported_fitz  # type: ignore[import-untyped]
+=======
+fitz: ModuleType | None
+try:
+    import fitz as _fitz  # type: ignore[import-untyped]
+    fitz = _fitz
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 except Exception:  # pragma: no cover - optional dependency.
     pass
 else:
     fitz = _imported_fitz
 
+<<<<<<< HEAD
 Image: Any = None
 try:
     from PIL import Image as _ImportedPILImage
+=======
+Image: Any
+try:
+    from PIL import Image as _Image
+    Image = _Image
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 except Exception:  # pragma: no cover - optional dependency.
     pass
 else:
     Image = _ImportedPILImage
 
+<<<<<<< HEAD
 pytesseract: Any = None
 try:
     import pytesseract as _imported_pytesseract  # type: ignore[import-untyped]
+=======
+pytesseract: Any
+try:
+    import pytesseract as _pytesseract  # type: ignore[import-untyped]
+    pytesseract = _pytesseract
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 except Exception:  # pragma: no cover - optional dependency.
     pass
 else:

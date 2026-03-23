@@ -100,20 +100,30 @@ class VecRetriever:
                 section_expr = f"COALESCE({section_expr}, '')"
                 content_expr = f"COALESCE({content_expr}, '')"
 
-                sql = f"""
+                joins_clause = " ".join(joins)
+                sql_template = """
                     SELECT
                         vec_index.file_uuid AS file_uuid,
                         vec_index.chunk_id AS chunk_id,
-                        {source_expr} AS source,
-                        {source_path_expr} AS source_path,
-                        {section_expr} AS section_title,
-                        {doc_type_expr} AS doc_type,
-                        {doc_chunk_count_expr} AS doc_chunk_count,
-                        {content_expr} AS content,
+                        __SOURCE_EXPR__ AS source,
+                        __SOURCE_PATH_EXPR__ AS source_path,
+                        __SECTION_EXPR__ AS section_title,
+                        __DOC_TYPE_EXPR__ AS doc_type,
+                        __DOC_CHUNK_COUNT_EXPR__ AS doc_chunk_count,
+                        __CONTENT_EXPR__ AS content,
                         vec_index.embedding AS embedding
                     FROM vec_index
-                    {' '.join(joins)}
+                    __JOINS__
                 """
+                sql = (
+                    sql_template.replace("__SOURCE_EXPR__", source_expr)
+                    .replace("__SOURCE_PATH_EXPR__", source_path_expr)
+                    .replace("__SECTION_EXPR__", section_expr)
+                    .replace("__DOC_TYPE_EXPR__", doc_type_expr)
+                    .replace("__DOC_CHUNK_COUNT_EXPR__", doc_chunk_count_expr)
+                    .replace("__CONTENT_EXPR__", content_expr)
+                    .replace("__JOINS__", joins_clause)
+                )
                 rows = conn.execute(
                     sql
                 ).fetchall()

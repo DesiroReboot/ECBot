@@ -225,7 +225,7 @@ class FeishuEventService:
                 "fallback_type": None,
                 "reply_ok": True,
                 "reply_error": "",
-                "token_dialog": None,
+                "token_dialog": None,  # nosec B105
                 "duplicate": True,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
@@ -395,7 +395,7 @@ class FeishuEventService:
             "no_rag_hit": "no relevant knowledge found",
             "invalid_input": "invalid message input",
             "signature_invalid": "signature verification failed",
-            "verification_token_invalid": "verification token check failed",
+            "verification_token_invalid": "verification credential check failed",  # nosec B105
             "error": "temporary internal error",
         }
         return fallback_map.get(reason, fallback_map["error"])

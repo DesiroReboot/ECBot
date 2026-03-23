@@ -6,7 +6,7 @@ import json
 import math
 from time import sleep
 from typing import Any
-from urllib import request
+from urllib import parse, request
 
 from src.RAG.config.kbase_config import KBaseConfig
 
@@ -78,7 +78,7 @@ class EmbeddingClient:
         return all_vectors
 
     def _embed_batch_remote(self, texts: list[str]) -> list[list[float]]:
-        url = f"{self.base_url}/embeddings"
+        url = self._safe_http_url(f"{self.base_url}/embeddings")
         payload = json.dumps(
             {
                 "model": self.remote_model,
@@ -100,7 +100,7 @@ class EmbeddingClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                with request.urlopen(req, timeout=self.timeout) as resp:
+                with request.urlopen(req, timeout=self.timeout) as resp:  # nosec B310
                     body = resp.read().decode("utf-8", errors="ignore")
                     data = json.loads(body)
                     rows = data.get("data", [])
@@ -115,6 +115,14 @@ class EmbeddingClient:
                     continue
                 break
         raise RuntimeError(f"remote embedding failed: {last_error}")
+
+    def _safe_http_url(self, raw_url: str) -> str:
+        parsed = parse.urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError(f"unsupported url scheme: {parsed.scheme!r}")
+        if not parsed.netloc:
+            raise ValueError("missing url host")
+        return raw_url
 
     def _local_vector(self, text: str) -> list[float]:
         digest = hashlib.sha256(text.encode("utf-8")).digest()

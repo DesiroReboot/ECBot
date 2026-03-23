@@ -6,10 +6,18 @@ from typing import Any
 
 from src.config import Config
 from src.core.generation import GenerationClient
+<<<<<<< HEAD
 from src.core.search.orchestrator import SearchOrchestrator
 from src.core.search.planner import RulePlanner
 from src.core.search.rag_search import RAGSearcher
+=======
+from src.core.search.query_analyzer import QueryAnalysis, QueryAnalyzer
+from src.core.search.rag_search import RAGSearcher, SearchResult
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 from src.core.search.source_utils import build_grouped_citations
+from src.core.search.web_result_evaluator import WebResultEvaluator
+from src.core.search.web_router import WebRouter
+from src.core.search.web_search_client import WebSearchClient, WebSearchResult
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.storage.manifest_store import ManifestStore
 
@@ -83,6 +91,7 @@ class ReActAgent:
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
         )
+<<<<<<< HEAD
         self.planner = RulePlanner()
         self.search_orchestrator = SearchOrchestrator(
             planner=self.planner,
@@ -97,6 +106,34 @@ class ReActAgent:
         orchestrator_result = self.search_orchestrator.search_with_trace(query)
         results = orchestrator_result.hits
         search_trace = orchestrator_result.trace_search
+=======
+        self.query_analyzer = QueryAnalyzer()
+        self.web_search_client = WebSearchClient(
+            provider=config.search.web_search_provider,
+            timeout=config.search.web_search_timeout,
+        )
+        self.web_result_evaluator = WebResultEvaluator()
+        self.web_router = WebRouter(
+            direct_thresholds=dict(config.search.web_direct_fusion_thresholds),
+        )
+
+    def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
+        results, search_trace = self.searcher.search_with_trace(query)
+        if not isinstance(search_trace, dict):
+            search_trace = {}
+        query_analysis = self.query_analyzer.analyze(
+            query=query,
+            local_results=results,
+            search_trace=search_trace,
+        )
+        results, web_trace = self._apply_web_routing(
+            query=query,
+            local_results=results,
+            query_analysis=query_analysis,
+        )
+        search_trace["web"] = web_trace
+
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
         manifest = self.manifest_store.get_manifest()
         trace: dict[str, Any] = {
             "query": query,
@@ -165,6 +202,221 @@ class ReActAgent:
             retrieval_confidence=confidence,
             trace=trace if include_trace else {},
         )
+
+    def _apply_web_routing(
+        self,
+        *,
+        query: str,
+        local_results: list[SearchResult],
+        query_analysis: QueryAnalysis,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        enabled = bool(self.config.search.web_search_enabled)
+        need_web_search = bool(query_analysis.need_web_search)
+        reasons = [str(reason) for reason in query_analysis.reasons if str(reason).strip()]
+        web_trace: dict[str, Any] = {
+            "need_web_search": need_web_search,
+            "fusion_strategy": "none",
+            "reasons": list(reasons),
+            "metrics": {
+                "temporal_intent_score": float(query_analysis.temporal_intent_score),
+                "domain_relevance_score": float(query_analysis.domain_relevance_score),
+                "oov_entity_score": float(query_analysis.oov_entity_score),
+                "kb_coverage_score": float(query_analysis.kb_coverage_score),
+            },
+            "fallback": False,
+        }
+        if not enabled:
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_search_disabled"])
+            return local_results, web_trace
+        if not need_web_search:
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_not_required"])
+            return local_results, web_trace
+
+        try:
+            web_results = self.web_search_client.search(
+                query,
+                limit=max(int(self.config.search.web_rag_max_docs), self.answer_top_k),
+            )
+        except Exception as exc:
+            web_trace["fallback"] = True
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_search_error"])
+            web_trace["error"] = str(exc)
+            return local_results, web_trace
+
+        web_trace["metrics"]["provider"] = self.config.search.web_search_provider
+        web_trace["metrics"]["result_count_raw"] = len(web_results)
+        if not web_results:
+            web_trace["fallback"] = True
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_no_results"])
+            return local_results, web_trace
+
+        evaluation = self.web_result_evaluator.evaluate(query=query, results=web_results)
+        decision = self.web_router.route(
+            query=query,
+            analysis=query_analysis,
+            evaluation=evaluation,
+        )
+        web_trace["fusion_strategy"] = decision.fusion_strategy
+        web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], decision.reasons)
+        web_trace["metrics"].update(decision.metrics)
+
+        if decision.fusion_strategy == "direct_fusion":
+            fused = self._build_direct_fusion_results(
+                query=query,
+                local_results=local_results,
+                web_results=web_results,
+            )
+            if fused:
+                return fused, web_trace
+            web_trace["fallback"] = True
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["direct_fusion_empty"])
+            return local_results, web_trace
+
+        if decision.fusion_strategy == "rag_fusion":
+            fused = self._build_rag_fusion_results(
+                query=query,
+                local_results=local_results,
+                web_results=web_results,
+            )
+            if fused:
+                return fused, web_trace
+            web_trace["fallback"] = True
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["rag_fusion_empty"])
+            return local_results, web_trace
+
+        web_trace["fallback"] = True
+        return local_results, web_trace
+
+    def _build_direct_fusion_results(
+        self,
+        *,
+        query: str,
+        local_results: list[Any],
+        web_results: list[WebSearchResult],
+    ) -> list[Any]:
+        limit = max(self.answer_top_k * 3, self.answer_top_k)
+        web_limit = min(int(self.config.search.web_rag_max_docs), 8)
+        web_rows = self._convert_web_results(query=query, web_results=web_results[:web_limit])
+        ordered = sorted(web_rows + list(local_results), key=lambda row: float(getattr(row, "score", 0.0)), reverse=True)
+        return self._dedupe_results(ordered, limit=limit)
+
+    def _build_rag_fusion_results(
+        self,
+        *,
+        query: str,
+        local_results: list[Any],
+        web_results: list[WebSearchResult],
+    ) -> list[Any]:
+        web_rows = self._convert_web_results(
+            query=query,
+            web_results=web_results[: int(self.config.search.web_rag_max_docs)],
+        )
+        query_terms = set(self._query_terms(query))
+        scored_rows: list[tuple[float, Any]] = []
+        for row in list(local_results) + web_rows:
+            base_score = max(0.0, float(getattr(row, "score", 0.0)))
+            content = str(getattr(row, "content", "")).lower()
+            overlap = 0.0
+            if query_terms:
+                overlap = sum(1 for token in query_terms if token in content) / len(query_terms)
+            source_path = str(getattr(row, "source_path", ""))
+            traceable_bonus = 0.06 if source_path.startswith(("http://", "https://")) else 0.0
+            final_score = min(1.0, base_score * 0.75 + overlap * 0.19 + traceable_bonus)
+            scored_rows.append((final_score, row))
+
+        scored_rows.sort(key=lambda row: row[0], reverse=True)
+        reranked = [row for _, row in scored_rows]
+        return self._dedupe_results(
+            reranked,
+            limit=max(self.answer_top_k * 4, int(self.config.search.web_rag_max_docs)),
+        )
+
+    def _convert_web_results(
+        self,
+        *,
+        query: str,
+        web_results: list[WebSearchResult],
+    ) -> list[Any]:
+        query_terms = set(self._query_terms(query))
+        converted: list[Any] = []
+        for index, row in enumerate(web_results, start=1):
+            text = f"{row.title} {row.snippet}".strip()
+            if query_terms:
+                overlap = sum(1 for token in query_terms if token in text.lower()) / len(query_terms)
+            else:
+                overlap = 0.0
+            score = min(1.0, max(float(row.score), 0.45 + overlap * 0.45))
+            source = row.title.strip() or row.source_domain or f"web_result_{index}"
+            content = row.snippet.strip() or row.title.strip() or row.url.strip()
+            if row.url:
+                content = f"{content}\nURL: {row.url}"
+            converted.append(
+                self._build_search_result(
+                    file_uuid=f"web-{index}",
+                    source=source,
+                    content=content,
+                    score=score,
+                    chunk_id=index,
+                    retrieval_paths=[{"source": "web", "rank": index, "score": score}],
+                    grading={"web_score": score},
+                    source_path=row.url,
+                    section_title=row.source_domain,
+                )
+            )
+        return converted
+
+    def _build_search_result(
+        self,
+        *,
+        file_uuid: str,
+        source: str,
+        content: str,
+        score: float,
+        chunk_id: int,
+        retrieval_paths: list[dict[str, Any]],
+        grading: dict[str, float],
+        source_path: str,
+        section_title: str,
+    ) -> SearchResult:
+        return SearchResult(
+            file_uuid=file_uuid,
+            source=source,
+            content=content,
+            score=score,
+            chunk_id=chunk_id,
+            matched_terms=[],
+            retrieval_paths=retrieval_paths,
+            grading=grading,
+            source_path=source_path,
+            section_title=section_title,
+        )
+
+    def _dedupe_results(self, rows: list[Any], *, limit: int) -> list[Any]:
+        deduped: list[Any] = []
+        seen: set[str] = set()
+        for row in rows:
+            source = str(getattr(row, "source", "")).strip().lower()
+            source_path = str(getattr(row, "source_path", "")).strip().lower()
+            content = str(getattr(row, "content", "")).strip().lower()
+            key = source_path or f"{source}|{content[:120]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    def _merge_reasons(self, left: list[str], right: list[str]) -> list[str]:
+        merged = [str(item) for item in left if str(item).strip()]
+        seen = set(merged)
+        for item in right:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            merged.append(text)
+            seen.add(text)
+        return merged
 
     def _build_citations(self, selected: list[Any]) -> list[dict[str, Any]]:
         return build_grouped_citations(selected)
@@ -250,7 +502,11 @@ class ReActAgent:
         vec_recall = search_trace.get("vector_recall", [])
         has_fts = isinstance(fts_recall, list) and bool(fts_recall)
         has_vec = isinstance(vec_recall, list) and bool(vec_recall)
+<<<<<<< HEAD
         if "fts_recall" in search_trace and not has_fts and not has_vec:
+=======
+        if not has_fts and not has_vec:
+>>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
             return "fts_no_hit"
 
         generation_trace = search_trace.get("generation", {})

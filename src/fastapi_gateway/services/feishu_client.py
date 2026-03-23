@@ -19,7 +19,7 @@ class FeishuAPIResponse:
 class FeishuAPIClient:
     def __init__(self, config: GatewayFeishuConfig):
         self.config = config
-        self._tenant_access_token = ""
+        self._tenant_access_token: str | None = None
         self._tenant_access_token_expire_at = 0.0
 
     def required_tokens(self) -> list[str]:
@@ -148,7 +148,7 @@ class FeishuAPIClient:
         json_payload: dict[str, Any],
         access_token: str | None = None,
     ) -> FeishuAPIResponse:
-        url = f"{self.config.openapi_base_url.rstrip('/')}{path}"
+        url = self._safe_http_url(f"{self.config.openapi_base_url.rstrip('/')}{path}")
         body = json.dumps(json_payload, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=utf-8"}
         if access_token:
@@ -156,7 +156,7 @@ class FeishuAPIClient:
         req = request.Request(url=url, data=body, headers=headers, method=method)
 
         try:
-            with request.urlopen(req, timeout=max(1, self.config.request_timeout)) as resp:
+            with request.urlopen(req, timeout=max(1, self.config.request_timeout)) as resp:  # nosec B310
                 data = json.loads(resp.read().decode("utf-8"))
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
@@ -179,9 +179,18 @@ class FeishuAPIClient:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 return payload
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            return {"raw": raw}
         return {"raw": raw}
+
+    @staticmethod
+    def _safe_http_url(raw_url: str) -> str:
+        parsed = parse.urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError(f"unsupported url scheme: {parsed.scheme!r}")
+        if not parsed.netloc:
+            raise ValueError("missing url host")
+        return raw_url
 
     @staticmethod
     def _is_unset(value: str) -> bool:

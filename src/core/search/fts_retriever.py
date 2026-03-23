@@ -75,23 +75,32 @@ class FTSRetriever:
                     doc_type_expr = f"COALESCE({doc_type_expr}, 'text')"
                 section_expr = f"COALESCE({section_expr}, '')"
 
-                sql = f"""
+                joins_clause = " ".join(joins)
+                sql_template = """
                     SELECT
                         fts_index.file_uuid AS file_uuid,
                         fts_index.chunk_id AS chunk_id,
-                        {source_expr} AS source,
-                        {source_path_expr} AS source_path,
-                        {section_expr} AS section_title,
-                        {doc_type_expr} AS doc_type,
-                        {doc_chunk_count_expr} AS doc_chunk_count,
+                        __SOURCE_EXPR__ AS source,
+                        __SOURCE_PATH_EXPR__ AS source_path,
+                        __SECTION_EXPR__ AS section_title,
+                        __DOC_TYPE_EXPR__ AS doc_type,
+                        __DOC_CHUNK_COUNT_EXPR__ AS doc_chunk_count,
                         fts_index.content AS content,
                         bm25(fts_index) AS fts_raw_score
                     FROM fts_index
-                    {' '.join(joins)}
+                    __JOINS__
                     WHERE fts_index MATCH ?
                     ORDER BY bm25(fts_index)
                     LIMIT ?
                 """
+                sql = (
+                    sql_template.replace("__SOURCE_EXPR__", source_expr)
+                    .replace("__SOURCE_PATH_EXPR__", source_path_expr)
+                    .replace("__SECTION_EXPR__", section_expr)
+                    .replace("__DOC_TYPE_EXPR__", doc_type_expr)
+                    .replace("__DOC_CHUNK_COUNT_EXPR__", doc_chunk_count_expr)
+                    .replace("__JOINS__", joins_clause)
+                )
                 rows = conn.execute(
                     sql,
                     (match_query, limit),
@@ -104,23 +113,32 @@ class FTSRetriever:
                             "(CASE WHEN LOWER(fts_index.content) LIKE ? THEN 1 ELSE 0 END)"
                             for _ in like_terms
                         )
-                        like_sql = f"""
+                        like_sql_template = """
                             SELECT
                                 fts_index.file_uuid AS file_uuid,
                                 fts_index.chunk_id AS chunk_id,
-                                {source_expr} AS source,
-                                {source_path_expr} AS source_path,
-                                {section_expr} AS section_title,
-                                {doc_type_expr} AS doc_type,
-                                {doc_chunk_count_expr} AS doc_chunk_count,
+                                __SOURCE_EXPR__ AS source,
+                                __SOURCE_PATH_EXPR__ AS source_path,
+                                __SECTION_EXPR__ AS section_title,
+                                __DOC_TYPE_EXPR__ AS doc_type,
+                                __DOC_CHUNK_COUNT_EXPR__ AS doc_chunk_count,
                                 fts_index.content AS content,
-                                ({like_score_expr}) AS fts_raw_score
+                                (__LIKE_SCORE_EXPR__) AS fts_raw_score
                             FROM fts_index
-                            {' '.join(joins)}
-                            WHERE ({like_score_expr}) > 0
+                            __JOINS__
+                            WHERE (__LIKE_SCORE_EXPR__) > 0
                             ORDER BY fts_raw_score DESC
                             LIMIT ?
                         """
+                        like_sql = (
+                            like_sql_template.replace("__SOURCE_EXPR__", source_expr)
+                            .replace("__SOURCE_PATH_EXPR__", source_path_expr)
+                            .replace("__SECTION_EXPR__", section_expr)
+                            .replace("__DOC_TYPE_EXPR__", doc_type_expr)
+                            .replace("__DOC_CHUNK_COUNT_EXPR__", doc_chunk_count_expr)
+                            .replace("__LIKE_SCORE_EXPR__", like_score_expr)
+                            .replace("__JOINS__", joins_clause)
+                        )
                         like_params = [f"%{term}%" for term in like_terms]
                         rows = conn.execute(
                             like_sql,

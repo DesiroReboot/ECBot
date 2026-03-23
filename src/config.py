@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -24,6 +24,28 @@ def _as_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
         items = [str(item).strip().lower() for item in value if str(item).strip()]
         return tuple(items) if items else default
     return default
+
+
+def _as_dict(value: Any, default: dict[str, Any]) -> dict[str, Any]:
+    if value is None:
+        return dict(default)
+    if isinstance(value, dict):
+        merged = dict(default)
+        merged.update(value)
+        return merged
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return dict(default)
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError:
+            return dict(default)
+        if isinstance(loaded, dict):
+            merged = dict(default)
+            merged.update(loaded)
+            return merged
+    return dict(default)
 
 
 def _env(name: str, default: Any) -> Any:
@@ -64,6 +86,18 @@ class SearchConfig:
     vec_top_k: int = 20
     fusion_rrf_k: int = 60
     context_top_k: int = 6
+    web_search_enabled: bool = False
+    web_search_provider: str = "mock"
+    web_search_timeout: int = 8
+    web_direct_fusion_thresholds: dict[str, float] = field(
+        default_factory=lambda: {
+            "result_count_max": 8.0,
+            "top3_mean_min": 0.72,
+            "score_gap_min": 0.08,
+            "noise_ratio_max": 0.25,
+        }
+    )
+    web_rag_max_docs: int = 16
 
 
 @dataclass
@@ -125,6 +159,7 @@ class GatewayFeishuConfig:
     verification_token: str = ""
     bot_name: str = "ECBot"
     target_chat_id: str = ""
+    webhook_host: str = "127.0.0.1"
     webhook_port: int = 8000
     webhook_path: str = "/webhook/feishu"
     request_timeout: int = 30
@@ -180,6 +215,19 @@ class Config:
         gateway_data = data.get("gateway", {}).get("feishu", {})
         output_guardrail_data = data.get("guardrails", {}).get("output", {})
         evaluation_data = data.get("evaluation", {})
+        web_threshold_defaults = {
+            "result_count_max": 8.0,
+            "top3_mean_min": 0.72,
+            "score_gap_min": 0.08,
+            "noise_ratio_max": 0.25,
+        }
+        web_thresholds = _as_dict(
+            _env(
+                "ECBOT_WEB_DIRECT_FUSION_THRESHOLDS",
+                search_data.get("web_direct_fusion_thresholds"),
+            ),
+            web_threshold_defaults,
+        )
 
         self.search = SearchConfig(
             rag_top_k=int(_env("ECBOT_RAG_TOP_K", search_data.get("rag_top_k", 5))),
@@ -187,6 +235,37 @@ class Config:
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
             fusion_rrf_k=int(_env("ECBOT_FUSION_RRF_K", search_data.get("fusion_rrf_k", 60))),
             context_top_k=int(_env("ECBOT_CONTEXT_TOP_K", search_data.get("context_top_k", 6))),
+            web_search_enabled=_as_bool(
+                _env("ECBOT_WEB_SEARCH_ENABLED", search_data.get("web_search_enabled", False)),
+                False,
+            ),
+            web_search_provider=str(
+                _env("ECBOT_WEB_SEARCH_PROVIDER", search_data.get("web_search_provider", "mock"))
+            ).strip(),
+            web_search_timeout=int(
+                _env("ECBOT_WEB_SEARCH_TIMEOUT", search_data.get("web_search_timeout", 8))
+            ),
+            web_direct_fusion_thresholds={
+                "result_count_max": float(
+                    web_thresholds.get(
+                        "result_count_max", web_threshold_defaults["result_count_max"]
+                    )
+                ),
+                "top3_mean_min": float(
+                    web_thresholds.get("top3_mean_min", web_threshold_defaults["top3_mean_min"])
+                ),
+                "score_gap_min": float(
+                    web_thresholds.get("score_gap_min", web_threshold_defaults["score_gap_min"])
+                ),
+                "noise_ratio_max": float(
+                    web_thresholds.get(
+                        "noise_ratio_max", web_threshold_defaults["noise_ratio_max"]
+                    )
+                ),
+            },
+            web_rag_max_docs=int(
+                _env("ECBOT_WEB_RAG_MAX_DOCS", search_data.get("web_rag_max_docs", 16))
+            ),
         )
         self.database = DatabaseConfig(
             db_path=str(_env("ECBOT_DB_PATH", db_data.get("db_path", "DB/ec_bot.db")))
@@ -309,6 +388,7 @@ class Config:
                 target_chat_id=str(
                     _env("ECBOT_FEISHU_TARGET_CHAT_ID", gateway_data.get("target_chat_id", ""))
                 ),
+                webhook_host=str(_env("ECBOT_FEISHU_WEBHOOK_HOST", gateway_data.get("webhook_host", "127.0.0.1"))),
                 webhook_port=int(gateway_data.get("webhook_port", 8000)),
                 webhook_path=str(gateway_data.get("webhook_path", "/webhook/feishu")),
                 request_timeout=int(gateway_data.get("request_timeout", 30)),
