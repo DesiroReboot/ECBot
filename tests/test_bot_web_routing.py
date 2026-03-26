@@ -24,7 +24,7 @@ def _local_result() -> SearchResult:
     return SearchResult(
         file_uuid="local-1",
         source="local-guide.md",
-        content="亚马逊选品需要先看需求，再评估竞争强度和利润。",
+        content="Amazon product selection should start from demand and profitability signals.",
         score=0.76,
         chunk_id=0,
     )
@@ -41,12 +41,23 @@ def _web_result(*, title: str, url: str, snippet: str, score: float) -> WebSearc
     )
 
 
-def _build_agent(*, web_enabled: bool, web_results: list[WebSearchResult]) -> ReActAgent:
+def _build_agent(
+    *,
+    web_enabled: bool,
+    web_results: list[WebSearchResult],
+    local_results: list[SearchResult] | None = None,
+    web_error: Exception | None = None,
+) -> ReActAgent:
     agent = ReActAgent.__new__(ReActAgent)
     search_cfg = SimpleNamespace(
         web_search_enabled=web_enabled,
-        web_search_provider="mock",
+        web_search_provider="tavily",
         web_search_timeout=8,
+        web_search_retries=1,
+        web_search_tavily_api_key="test-key",
+        web_search_tavily_base_url="https://api.tavily.com/search",
+        web_search_depth="basic",
+        web_search_max_results=8,
         web_direct_fusion_thresholds={
             "result_count_max": 8.0,
             "top3_mean_min": 0.72,
@@ -60,10 +71,13 @@ def _build_agent(*, web_enabled: bool, web_results: list[WebSearchResult]) -> Re
         generation=GenerationConfig(mode="template"),
     )
     agent.answer_top_k = 3
-    agent.searcher = _DummySearcher([_local_result()])
+    agent.searcher = _DummySearcher(local_results if local_results is not None else [_local_result()])
     agent.manifest_store = SimpleNamespace(get_manifest=lambda: {"version": "ok"})
     agent.query_analyzer = QueryAnalyzer()
-    agent.web_search_client = SimpleNamespace(search=lambda query, limit: list(web_results))  # noqa: ARG005
+    if web_error is None:
+        agent.web_search_client = SimpleNamespace(search=lambda query, limit: list(web_results))  # noqa: ARG005
+    else:
+        agent.web_search_client = SimpleNamespace(search=lambda query, limit: (_ for _ in ()).throw(web_error))  # noqa: ARG005
     agent.web_result_evaluator = WebResultEvaluator()
     agent.web_router = WebRouter(direct_thresholds=search_cfg.web_direct_fusion_thresholds)
     agent.generation_client = SimpleNamespace()
@@ -73,26 +87,26 @@ def _build_agent(*, web_enabled: bool, web_results: list[WebSearchResult]) -> Re
 def test_run_sync_applies_direct_fusion_and_writes_web_trace() -> None:
     web_rows = [
         _web_result(
-            title="拉布布选品趋势报告",
+            title="Fabric category trend report",
             url="https://news.example.com/a",
-            snippet="最近拉布布相关选品热度上升，供应链开始扩容。",
+            snippet="Recent demand and sourcing indicators show sustained momentum.",
             score=0.95,
         ),
         _web_result(
-            title="跨境卖家选品观察",
+            title="Cross-border seller category watch",
             url="https://news.example.com/b",
-            snippet="平台类目近期变化主要集中在潮玩和礼品。",
+            snippet="Category movement is now concentrated in giftable products.",
             score=0.72,
         ),
         _web_result(
-            title="拉布布供应链动态",
+            title="Supply chain update",
             url="https://news.example.com/c",
-            snippet="今年上游原料价格趋稳，交付周期缩短。",
+            snippet="Upstream price volatility has narrowed and lead time improved.",
             score=0.7,
         ),
     ]
     agent = _build_agent(web_enabled=True, web_results=web_rows)
-    response = agent.run_sync("最近拉布布选品趋势如何？", include_trace=True)
+    response = agent.run_sync("latest product selection trend", include_trace=True)
 
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
@@ -103,10 +117,46 @@ def test_run_sync_applies_direct_fusion_and_writes_web_trace() -> None:
 
 def test_run_sync_fallbacks_to_local_when_web_empty() -> None:
     agent = _build_agent(web_enabled=True, web_results=[])
-    response = agent.run_sync("最近亚马逊选品趋势如何？", include_trace=True)
+    response = agent.run_sync("latest amazon category trend", include_trace=True)
 
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
     assert web_trace["fusion_strategy"] == "none"
     assert web_trace["fallback"] is True
     assert "web_no_results" in web_trace["reasons"]
+
+
+def test_kb_empty_auto_triggers_web_fallback_chain() -> None:
+    web_rows = [
+        _web_result(
+            title="Policy change",
+            url="https://news.example.com/policy",
+            snippet="The platform published a new policy update this week.",
+            score=0.88,
+        )
+    ]
+    agent = _build_agent(web_enabled=True, web_results=web_rows, local_results=[])
+    response = agent.run_sync("latest platform policy updates", include_trace=True)
+
+    web_trace = response.trace["search"]["web"]
+    assert web_trace["need_web_search"] is True
+    assert "kb_empty_triggered_web_fallback" in web_trace["reasons"]
+    assert web_trace["fallback"] is False
+    assert all(step.get("stage") != "fallback_answer" for step in response.trace["strategy_execution"])
+
+
+def test_web_provider_error_records_reason_and_returns_safe_fallback() -> None:
+    agent = _build_agent(
+        web_enabled=True,
+        web_results=[],
+        local_results=[],
+        web_error=RuntimeError("provider_misconfigured:tavily_api_key_missing"),
+    )
+    response = agent.run_sync("latest platform policy updates", include_trace=True)
+
+    web_trace = response.trace["search"]["web"]
+    assert web_trace["need_web_search"] is True
+    assert web_trace["fallback"] is True
+    assert "web_search_error" in web_trace["reasons"]
+    assert "provider_misconfigured" in web_trace["reasons"]
+    assert any(step.get("stage") == "fallback_answer" for step in response.trace["strategy_execution"])

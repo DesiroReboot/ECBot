@@ -98,7 +98,7 @@ class SearchOrchestrator:
             "requested": planner_output.need_web_search,
             "executed": False,
             "execution_skipped": True,
-            "skip_reason": "web_search_reserved_not_enabled",
+            "skip_reason": "web_execution_delegated_to_bot_agent",
             "interface": "web_searcher.search_with_trace(query, top_k=...)",
             "fallback_used": False,
             "source_route": planner_output.source_route,

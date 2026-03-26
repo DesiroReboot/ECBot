@@ -79,6 +79,21 @@ def _load_dotenv_file(path: str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
+def _resolve_default_private_dotenv() -> str:
+    # Prefer sibling repo path like E:\DATA\ECBot\.env when running in E:\DATA\ECBot-memory/web-search.
+    sibling_private = Path.cwd().resolve().parent / "ECBot" / ".env"
+    if sibling_private.exists() and sibling_private.is_file():
+        return str(sibling_private)
+    return ".env"
+
+
+def _load_env_layers() -> None:
+    private_dotenv = os.getenv("ECBOT_DOTENV_PATH", _resolve_default_private_dotenv())
+    # Private first so it has higher precedence; public template only backfills missing keys.
+    _load_dotenv_file(private_dotenv)
+    _load_dotenv_file(".env.example")
+
+
 @dataclass
 class SearchConfig:
     rag_top_k: int = 5
@@ -89,6 +104,11 @@ class SearchConfig:
     web_search_enabled: bool = False
     web_search_provider: str = "mock"
     web_search_timeout: int = 8
+    web_search_retries: int = 1
+    web_search_tavily_api_key: str = ""
+    web_search_tavily_base_url: str = "https://api.tavily.com/search"
+    web_search_max_results: int = 8
+    web_search_depth: str = "basic"
     web_direct_fusion_thresholds: dict[str, float] = field(
         default_factory=lambda: {
             "result_count_max": 8.0,
@@ -98,6 +118,8 @@ class SearchConfig:
         }
     )
     web_rag_max_docs: int = 16
+    search_progress_enabled: bool = True
+    search_progress_keyword_top_k: int = 4
 
 
 @dataclass
@@ -193,8 +215,7 @@ class Config:
     DEFAULT_CONFIG_PATH = "config/config.json"
 
     def __init__(self, config_path: str | None = None):
-        dotenv_path = os.getenv("ECBOT_DOTENV_PATH", ".env")
-        _load_dotenv_file(dotenv_path)
+        _load_env_layers()
 
         resolved_config_path = config_path or os.getenv("ECBOT_CONFIG_PATH") or self.DEFAULT_CONFIG_PATH
         # Backward-compatible fallback for legacy single-file layout.
@@ -245,6 +266,36 @@ class Config:
             web_search_timeout=int(
                 _env("ECBOT_WEB_SEARCH_TIMEOUT", search_data.get("web_search_timeout", 8))
             ),
+            web_search_retries=int(
+                _env("ECBOT_WEB_SEARCH_RETRIES", search_data.get("web_search_retries", 1))
+            ),
+            web_search_tavily_api_key=str(
+                _env(
+                    "ECBOT_TAVILY_API_KEY",
+                    search_data.get("web_search_tavily_api_key", ""),
+                )
+            ).strip(),
+            web_search_tavily_base_url=str(
+                _env(
+                    "ECBOT_TAVILY_BASE_URL",
+                    search_data.get(
+                        "web_search_tavily_base_url",
+                        "https://api.tavily.com/search",
+                    ),
+                )
+            ).strip(),
+            web_search_max_results=int(
+                _env(
+                    "ECBOT_WEB_SEARCH_MAX_RESULTS",
+                    search_data.get("web_search_max_results", 8),
+                )
+            ),
+            web_search_depth=str(
+                _env(
+                    "ECBOT_WEB_SEARCH_DEPTH",
+                    search_data.get("web_search_depth", "basic"),
+                )
+            ).strip(),
             web_direct_fusion_thresholds={
                 "result_count_max": float(
                     web_thresholds.get(
@@ -265,6 +316,19 @@ class Config:
             },
             web_rag_max_docs=int(
                 _env("ECBOT_WEB_RAG_MAX_DOCS", search_data.get("web_rag_max_docs", 16))
+            ),
+            search_progress_enabled=_as_bool(
+                _env(
+                    "ECBOT_SEARCH_PROGRESS_ENABLED",
+                    search_data.get("search_progress_enabled", True),
+                ),
+                True,
+            ),
+            search_progress_keyword_top_k=int(
+                _env(
+                    "ECBOT_SEARCH_PROGRESS_KEYWORD_TOP_K",
+                    search_data.get("search_progress_keyword_top_k", 4),
+                )
             ),
         )
         self.database = DatabaseConfig(

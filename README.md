@@ -22,7 +22,7 @@ ECBot 是一个面向飞书的问答机器人，当前网关已重构为 **FastA
 ## 配置示例
 
 配置文件默认读取 `config/config.json`（若不存在会回退到 `config.json`）。
-程序启动时会自动加载项目根目录 `.env`（可用 `ECBOT_DOTENV_PATH` 指定其他路径）。
+程序启动时会优先加载私有 `E:\\DATA\\ECBot\\.env`（可用 `ECBOT_DOTENV_PATH` 指定其他路径），再用项目内 `.env.example` 补齐缺失变量。
 
 ```json
 {
@@ -45,7 +45,7 @@ ECBot 是一个面向飞书的问答机器人，当前网关已重构为 **FastA
 说明：
 - `receive_mode=webhook` 时使用 HTTP 回调。
 - `receive_mode=long_connection` 时使用飞书 SDK 长连接，不需要配置订阅 URL。
-- 配置优先级：系统环境变量 > `.env` > `config/config.json`。
+- 配置优先级：系统环境变量 > 私有 `E:\\DATA\\ECBot\\.env`（或 `ECBOT_DOTENV_PATH`）> `.env.example` > `config/config.json`。
 
 ## .env 配置（推荐）
 
@@ -154,4 +154,5 @@ https://<your-public-domain>/webhook/feishu
 ```powershell
 python -m pytest -q tests/test_fastapi_gateway_runtime.py tests/test_fastapi_gateway_handler.py
 ```
+
 

@@ -59,4 +59,5 @@ def test_query_analyzer_triggers_for_low_kb_coverage() -> None:
 
     assert analysis.kb_coverage_score == 0.0
     assert analysis.need_web_search is True
+    assert "kb_no_hit" in analysis.reasons
     assert "kb_coverage_low" in analysis.reasons

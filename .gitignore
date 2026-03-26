@@ -1,4 +1,5 @@
-config/
+config/*
+!config/config.md
 !src/RAG/config/
 !src/RAG/config/__init__.py
 !src/RAG/config/kbase_config.py
@@ -15,18 +16,14 @@ scripts/
 !scripts/migrate.py
 Eval/
 Doc/*
-<<<<<<< HEAD
-=======
 !Doc/RAG.md
 tmp_runtime/
->>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 src/__pycache__
 .env
 .env.local
 .env.*.local
 src/**/**/__pycache__
 tests/**/**/__pycache__
-<<<<<<< HEAD
 
 # Databases / local state
 *.db
@@ -35,6 +32,12 @@ tests/**/**/__pycache__
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Python caches
+**/__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
 
 # Temp and test artifacts
 .pytest_cache/
@@ -49,12 +52,3 @@ tmp/
 temp/
 *.tmp
 *.temp
-=======
-*.db
-*.db-journal
-**/__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
->>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)

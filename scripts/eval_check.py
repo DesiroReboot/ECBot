@@ -38,6 +38,10 @@ class EvalResult:
     claim_citation_precision: float
     hallucination_rate: float
     failure_path: dict[str, Any]
+    answer_completeness: float = 0.0
+    instruction_following_rate: float = 0.0
+    actionability_score: float = 0.0
+    generation_quality_score: float = 0.0
     repeat_runs: int = 1
     pass_count: int = 0
     pass_rate_at_n: float = 0.0
@@ -60,6 +64,11 @@ class EvalSummary:
     total: int
     passed: int
     pass_rate_at_n_avg: float
+    answer_completeness_avg: float = 0.0
+    instruction_following_rate_avg: float = 0.0
+    actionability_score_avg: float = 0.0
+    generation_quality_score_avg: float = 0.0
+    overall_score_v2: float = 0.0
 
 
 class EvalChecker:
@@ -106,6 +115,10 @@ class EvalChecker:
                     claim_citation_precision=base.claim_citation_precision,
                     hallucination_rate=base.hallucination_rate,
                     failure_path=base.failure_path,
+                    answer_completeness=base.answer_completeness,
+                    instruction_following_rate=base.instruction_following_rate,
+                    actionability_score=base.actionability_score,
+                    generation_quality_score=base.generation_quality_score,
                     repeat_runs=safe_repeat,
                     pass_count=pass_count,
                     pass_rate_at_n=pass_rate,
@@ -119,18 +132,99 @@ class EvalChecker:
                 }
             }
 
-        passed_items = sum(1 for row in aggregated_results if row.pass_count > 0)
-        pass_rate_avg = (
-            round(mean([row.pass_rate_at_n for row in aggregated_results]), 4)
-            if aggregated_results
-            else 0.0
+        summary = self._calculate_summary(aggregated_results, repeat_runs=safe_repeat)
+        return summary, aggregated_results, traces
+
+    def calculate_answer_completeness(
+        self,
+        *,
+        answer: str,
+        must_keyword_coverage: float,
+        rubric: dict[str, Any] | None = None,
+    ) -> float:
+        safe_rubric = rubric or {}
+        sections = [str(item).strip() for item in safe_rubric.get("must_have_sections", []) if str(item).strip()]
+        if not sections:
+            section_coverage = 1.0
+        else:
+            hits = sum(1 for section in sections if section in answer)
+            section_coverage = hits / len(sections)
+        score = 0.6 * max(0.0, min(1.0, float(must_keyword_coverage))) + 0.4 * section_coverage
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def calculate_instruction_following_rate(
+        self,
+        *,
+        answer: str,
+        citations: list[dict[str, Any]],
+        rubric: dict[str, Any] | None = None,
+        forbidden_claims: list[str] | None = None,
+    ) -> float:
+        safe_rubric = rubric or {}
+        score = 1.0
+        if bool(safe_rubric.get("citation_required")) and not citations:
+            score -= 0.4
+        sections = [str(item).strip() for item in safe_rubric.get("must_have_sections", []) if str(item).strip()]
+        if sections:
+            hits = sum(1 for section in sections if section in answer)
+            section_coverage = hits / len(sections)
+            score -= 0.4 * (1.0 - section_coverage)
+        for claim in forbidden_claims or []:
+            token = str(claim).strip()
+            if token and token in answer:
+                score -= 0.2
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def calculate_actionability_score(self, answer: str) -> float:
+        lines = [line.strip() for line in str(answer).splitlines() if line.strip()]
+        if not lines:
+            return 0.0
+        step_hits = len(re.findall(r"(?m)(^\d+\.\s+|步骤|step)", answer.lower()))
+        action_tokens = re.findall(r"(先|再|最后|执行|检查|优化|验证|follow|review|test)", answer.lower())
+        structure = min(1.0, step_hits / 3.0)
+        action_density = min(1.0, len(action_tokens) / 4.0)
+        score = 0.55 * structure + 0.45 * action_density
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def calculate_generation_quality_score(
+        self,
+        *,
+        answer_completeness: float,
+        instruction_following_rate: float,
+        actionability_score: float,
+    ) -> float:
+        score = (
+            0.4 * max(0.0, min(1.0, float(answer_completeness)))
+            + 0.35 * max(0.0, min(1.0, float(instruction_following_rate)))
+            + 0.25 * max(0.0, min(1.0, float(actionability_score)))
         )
-        summary = EvalSummary(
-            total=len(aggregated_results),
+        return round(max(0.0, min(1.0, score)), 4)
+
+    def _calculate_summary(self, results: list[EvalResult], *, repeat_runs: int) -> EvalSummary:
+        if not results:
+            return EvalSummary(total=0, passed=0, pass_rate_at_n_avg=0.0)
+
+        passed_items = sum(1 for row in results if row.pass_count > 0)
+        pass_rate_avg = round(mean([row.pass_rate_at_n for row in results]), 4)
+        answer_completeness_avg = round(mean([float(row.answer_completeness) for row in results]), 4)
+        instruction_following_rate_avg = round(mean([float(row.instruction_following_rate) for row in results]), 4)
+        actionability_score_avg = round(mean([float(row.actionability_score) for row in results]), 4)
+        generation_quality_score_avg = round(mean([float(row.generation_quality_score) for row in results]), 4)
+
+        repeat_factor = min(1.0, max(1, int(repeat_runs)) / 3.0)
+        overall_score = 0.45 * generation_quality_score_avg + 0.45 * pass_rate_avg + 0.1 * repeat_factor
+        overall_score_v2 = round(max(0.0, min(1.0, overall_score)), 4)
+
+        return EvalSummary(
+            total=len(results),
             passed=passed_items,
             pass_rate_at_n_avg=pass_rate_avg,
+            answer_completeness_avg=answer_completeness_avg,
+            instruction_following_rate_avg=instruction_following_rate_avg,
+            actionability_score_avg=actionability_score_avg,
+            generation_quality_score_avg=generation_quality_score_avg,
+            overall_score_v2=overall_score_v2,
         )
-        return summary, aggregated_results, traces
 
     def calculate_claim_metrics(
         self,

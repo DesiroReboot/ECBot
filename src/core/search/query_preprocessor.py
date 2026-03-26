@@ -34,6 +34,22 @@ class QueryPreprocessor:
             "theme_hints": theme_hints,
         }
 
+    def extract_keywords(self, query: str, top_k: int = 4) -> list[str]:
+        processed = self.process(query)
+        ordered = list(processed["tokens"])
+        selected: list[str] = []
+        for token in ordered:
+            text = str(token).strip()
+            if len(text) < 2:
+                continue
+            if re.fullmatch(r"\d+", text):
+                continue
+            if text not in selected:
+                selected.append(text)
+            if len(selected) >= max(1, int(top_k)):
+                break
+        return selected
+
     def _tokenize(self, text: str) -> list[str]:
         tokens: list[str] = []
         tokens.extend(re.findall(r"[a-z0-9_]+", text))

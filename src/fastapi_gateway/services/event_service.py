@@ -9,6 +9,7 @@ from typing import Any
 
 from src.config import Config
 from src.core.bot_agent import ReActAgent
+from src.core.search.query_preprocessor import QueryPreprocessor
 from src.fastapi_gateway.security.verifier import FeishuAuthVerifier
 from src.fastapi_gateway.services.feishu_client import FeishuAPIClient
 
@@ -22,10 +23,19 @@ class GatewayResult:
 
 
 class FeishuEventService:
+    _SEARCH_PROGRESS_MARKERS: tuple[str, ...] = (
+        "latest",
+        "recent",
+        "today",
+        "this year",
+        "this month",
+    )
+
     def __init__(self, config: Config):
         self.config = config
         self.agent = ReActAgent(config)
         self.api_client = FeishuAPIClient(config.gateway.feishu)
+        self.query_preprocessor = QueryPreprocessor()
         self._dedup_ttl_seconds = 120
         self._dedup_max_entries = 2048
         self._processed_event_keys: dict[str, float] = {}
@@ -246,7 +256,9 @@ class FeishuEventService:
                 message=self._fallback_message("invalid_input"),
                 fallback_type="error",
             )
+            progress_reply_result = {"ok": False, "error": "query_empty", "data": {}}
         else:
+            progress_reply_result = self._try_send_progress_reply(event_data=event_data, query=query)
             result = self._process_query(query)
 
         reply_result = self._reply_to_event(event_data=event_data, text=result.message)
@@ -257,6 +269,8 @@ class FeishuEventService:
             "fallback_type": result.fallback_type,
             "reply_ok": reply_result.get("ok", False),
             "reply_error": reply_result.get("error", ""),
+            "progress_reply_ok": progress_reply_result.get("ok", False),
+            "progress_reply_error": progress_reply_result.get("error", ""),
             "token_dialog": token_dialog if not token_dialog["ok"] else None,
             "embedding_dialog": result.embedding_dialog,
             "timestamp": datetime.now(UTC).isoformat(),
@@ -310,6 +324,33 @@ class FeishuEventService:
             message=response.answer,
             embedding_dialog=embedding_dialog,
         )
+
+    def _try_send_progress_reply(self, *, event_data: dict[str, Any], query: str) -> dict[str, Any]:
+        if not self._should_send_search_progress(query):
+            return {"ok": False, "error": "progress_not_required", "data": {}}
+        text = self._build_search_progress_text(query)
+        try:
+            return self._reply_to_event(event_data=event_data, text=text)
+        except Exception as exc:
+            return {"ok": False, "error": f"progress_send_error:{exc}", "data": {}}
+
+    def _should_send_search_progress(self, query: str) -> bool:
+        if not bool(self.config.search.web_search_enabled):
+            return False
+        if not bool(self.config.search.search_progress_enabled):
+            return False
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return False
+        if any(marker in lowered for marker in self._SEARCH_PROGRESS_MARKERS):
+            return True
+        return any(hint in lowered for hint in ("最近", "最新", "近期", "本周", "本月", "今年"))
+
+    def _build_search_progress_text(self, query: str) -> str:
+        top_k = max(1, int(self.config.search.search_progress_keyword_top_k))
+        keywords = self.query_preprocessor.extract_keywords(query, top_k=top_k)
+        keyword_text = ", ".join(keywords[:top_k]) if keywords else str(query).strip()
+        return f"正在搜索：{keyword_text}"
 
     def _reply_to_event(self, *, event_data: dict[str, Any], text: str) -> dict[str, Any]:
         event = self._extract_event(event_data)

@@ -83,4 +83,4 @@ def test_orchestrator_uses_planner_fields_and_skips_web_execution() -> None:
     assert result.trace_search["planner"]["source_route"] == "hybrid"
     assert result.trace_search["planner"]["fusion_strategy"] == "rag_fusion"
     assert result.trace_search["web"]["executed"] is False
-    assert result.trace_search["web"]["skip_reason"] == "web_search_reserved_not_enabled"
+    assert result.trace_search["web"]["skip_reason"] == "web_execution_delegated_to_bot_agent"

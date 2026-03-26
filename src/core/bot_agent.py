@@ -6,14 +6,10 @@ from typing import Any
 
 from src.config import Config
 from src.core.generation import GenerationClient
-<<<<<<< HEAD
 from src.core.search.orchestrator import SearchOrchestrator
 from src.core.search.planner import RulePlanner
-from src.core.search.rag_search import RAGSearcher
-=======
 from src.core.search.query_analyzer import QueryAnalysis, QueryAnalyzer
 from src.core.search.rag_search import RAGSearcher, SearchResult
->>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
 from src.core.search.source_utils import build_grouped_citations
 from src.core.search.web_result_evaluator import WebResultEvaluator
 from src.core.search.web_router import WebRouter
@@ -91,7 +87,6 @@ class ReActAgent:
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
         )
-<<<<<<< HEAD
         self.planner = RulePlanner()
         self.search_orchestrator = SearchOrchestrator(
             planner=self.planner,
@@ -101,16 +96,15 @@ class ReActAgent:
         )
         # Backward-compatible alias for any legacy direct access.
         self.searcher = self.rag_searcher
-
-    def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
-        orchestrator_result = self.search_orchestrator.search_with_trace(query)
-        results = orchestrator_result.hits
-        search_trace = orchestrator_result.trace_search
-=======
         self.query_analyzer = QueryAnalyzer()
         self.web_search_client = WebSearchClient(
             provider=config.search.web_search_provider,
             timeout=config.search.web_search_timeout,
+            max_retries=config.search.web_search_retries,
+            tavily_api_key=config.search.web_search_tavily_api_key,
+            tavily_base_url=config.search.web_search_tavily_base_url,
+            tavily_search_depth=config.search.web_search_depth,
+            max_results=config.search.web_search_max_results,
         )
         self.web_result_evaluator = WebResultEvaluator()
         self.web_router = WebRouter(
@@ -118,7 +112,22 @@ class ReActAgent:
         )
 
     def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
-        results, search_trace = self.searcher.search_with_trace(query)
+        citations_from_search: list[dict[str, Any]] | None = None
+        confidence_from_search = 0.0
+        if hasattr(self, "search_orchestrator") and self.search_orchestrator is not None:
+            orchestrator_result = self.search_orchestrator.search_with_trace(query)
+            results = list(orchestrator_result.hits)
+            search_trace = (
+                orchestrator_result.trace_search if isinstance(orchestrator_result.trace_search, dict) else {}
+            )
+            raw_citations = getattr(orchestrator_result, "citations", None)
+            if isinstance(raw_citations, list):
+                citations_from_search = raw_citations
+            confidence_from_search = float(getattr(orchestrator_result, "retrieval_confidence", 0.0) or 0.0)
+        else:
+            searcher = getattr(self, "searcher", None) or self.rag_searcher
+            results, search_trace = searcher.search_with_trace(query)
+
         if not isinstance(search_trace, dict):
             search_trace = {}
         query_analysis = self.query_analyzer.analyze(
@@ -132,8 +141,6 @@ class ReActAgent:
             query_analysis=query_analysis,
         )
         search_trace["web"] = web_trace
-
->>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
         manifest = self.manifest_store.get_manifest()
         trace: dict[str, Any] = {
             "query": query,
@@ -166,7 +173,7 @@ class ReActAgent:
             )
 
         selected = results[: self.answer_top_k]
-        citations = orchestrator_result.citations or self._build_citations(selected)
+        citations = citations_from_search or self._build_citations(selected)
         draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
         template_answer = self._render_template_answer(draft)
         answer, generation_meta = self._compose_answer(
@@ -175,7 +182,7 @@ class ReActAgent:
             search_trace=search_trace,
         )
         confidence = max(
-            float(orchestrator_result.retrieval_confidence),
+            confidence_from_search,
             min(1.0, sum(max(0.0, item.score) for item in selected) / max(len(selected), 1)),
         )
 
@@ -211,8 +218,11 @@ class ReActAgent:
         query_analysis: QueryAnalysis,
     ) -> tuple[list[Any], dict[str, Any]]:
         enabled = bool(self.config.search.web_search_enabled)
-        need_web_search = bool(query_analysis.need_web_search)
+        kb_empty = len(local_results) == 0
+        need_web_search = bool(query_analysis.need_web_search) or kb_empty
         reasons = [str(reason) for reason in query_analysis.reasons if str(reason).strip()]
+        if kb_empty:
+            reasons = self._merge_reasons(reasons, ["kb_empty_triggered_web_fallback"])
         web_trace: dict[str, Any] = {
             "need_web_search": need_web_search,
             "fusion_strategy": "none",
@@ -222,6 +232,7 @@ class ReActAgent:
                 "domain_relevance_score": float(query_analysis.domain_relevance_score),
                 "oov_entity_score": float(query_analysis.oov_entity_score),
                 "kb_coverage_score": float(query_analysis.kb_coverage_score),
+                "kb_result_count": len(local_results),
             },
             "fallback": False,
         }
@@ -239,8 +250,12 @@ class ReActAgent:
             )
         except Exception as exc:
             web_trace["fallback"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_search_error"])
-            web_trace["error"] = str(exc)
+            error_text = str(exc)
+            error_reasons = ["web_search_error"]
+            if "provider_misconfigured" in error_text:
+                error_reasons.append("provider_misconfigured")
+            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], error_reasons)
+            web_trace["error"] = error_text
             return local_results, web_trace
 
         web_trace["metrics"]["provider"] = self.config.search.web_search_provider
@@ -502,11 +517,7 @@ class ReActAgent:
         vec_recall = search_trace.get("vector_recall", [])
         has_fts = isinstance(fts_recall, list) and bool(fts_recall)
         has_vec = isinstance(vec_recall, list) and bool(vec_recall)
-<<<<<<< HEAD
         if "fts_recall" in search_trace and not has_fts and not has_vec:
-=======
-        if not has_fts and not has_vec:
->>>>>>> e764109 (feat(search): add web routing pipeline and retrieval scoring)
             return "fts_no_hit"
 
         generation_trace = search_trace.get("generation", {})

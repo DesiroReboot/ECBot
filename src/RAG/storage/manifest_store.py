@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from src.RAG.storage.sqlite_conn import connect
@@ -14,9 +15,17 @@ class ManifestStore:
                 ensure_sqlite_schema(conn)
 
     def get_manifest(self) -> dict[str, Any] | None:
-        with connect(self.db_path) as conn:
-            row = conn.execute("SELECT * FROM index_manifest WHERE id = 1").fetchone()
-            return dict(row) if row else None
+        try:
+            with connect(self.db_path) as conn:
+                row = conn.execute("SELECT * FROM index_manifest WHERE id = 1").fetchone()
+                return dict(row) if row else None
+        except sqlite3.OperationalError as exc:
+            if "no such table: index_manifest" not in str(exc).lower():
+                raise
+            with connect(self.db_path) as conn:
+                ensure_sqlite_schema(conn)
+                row = conn.execute("SELECT * FROM index_manifest WHERE id = 1").fetchone()
+                return dict(row) if row else None
 
     def upsert_manifest(
         self,

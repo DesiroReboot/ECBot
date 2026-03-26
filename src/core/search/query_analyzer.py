@@ -130,6 +130,8 @@ class QueryAnalyzer:
         )
 
         reasons: list[str] = []
+        if not local_rows:
+            reasons.append("kb_no_hit")
         if temporal_score >= 0.6:
             reasons.append("temporal_intent_high")
         if domain_score >= 0.5 and oov_score >= 0.6:

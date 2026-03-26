@@ -28,6 +28,7 @@ class _DummyAPIClient:
         self._dialog = {"ok": True, "missing_tokens": [], "message": ""}
         self.reply_calls = 0
         self.message_calls = 0
+        self.reply_texts: list[str] = []
 
     def token_dialog_payload(self):
         return self._dialog
@@ -47,6 +48,7 @@ class _DummyAPIClient:
 
     def send_reply_text(self, *, message_id: str, text: str):  # noqa: ARG002
         self.reply_calls += 1
+        self.reply_texts.append(text)
         class _Resp:
             ok = True
             error = ""
@@ -66,6 +68,11 @@ class _DummyAPIClient:
 
 def _build_config(tmp_path: Path, extra: dict | None = None) -> Config:
     payload = {
+        "search": {
+            "web_search_enabled": False,
+            "search_progress_enabled": True,
+            "search_progress_keyword_top_k": 4,
+        },
         "gateway": {
             "feishu": {
                 "enabled": True,
@@ -79,7 +86,10 @@ def _build_config(tmp_path: Path, extra: dict | None = None) -> Config:
         }
     }
     if extra:
-        payload["gateway"]["feishu"].update(extra["gateway"]["feishu"])
+        if "gateway" in extra and "feishu" in extra["gateway"]:
+            payload["gateway"]["feishu"].update(extra["gateway"]["feishu"])
+        if "search" in extra and isinstance(extra["search"], dict):
+            payload["search"].update(extra["search"])
     path = tmp_path / "config.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return Config(str(path))
@@ -180,6 +190,38 @@ def test_event_reply_pipeline(tmp_path: Path) -> None:
     payload = resp.json()
     assert payload["success"] is True
     assert payload["reply_ok"] is True
+    assert payload["progress_reply_ok"] is False
+
+
+def test_event_reply_pipeline_sends_progress_before_final_when_search_needed(tmp_path: Path) -> None:
+    cfg = _build_config(
+        tmp_path,
+        extra={"search": {"web_search_enabled": True, "search_progress_enabled": True}},
+    )
+    app = create_app(cfg)
+    app.state.event_service.agent = _DummyAgent()
+    api = _DummyAPIClient()
+    app.state.event_service.api_client = api
+
+    client = TestClient(app)
+    resp = client.post(
+        "/webhook/feishu",
+        json={
+            "type": "event_callback",
+            "event": {
+                "message": {"message_id": "om_progress", "text": "最近跨境电商政策变化有哪些"},
+                "sender": {"sender_type": "user"},
+            },
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["success"] is True
+    assert payload["progress_reply_ok"] is True
+    assert payload["reply_ok"] is True
+    assert len(api.reply_texts) == 2
+    assert api.reply_texts[0].startswith("正在搜索：")
+    assert api.reply_texts[1] == "ok"
 
 
 def test_duplicate_event_callback_is_ignored(tmp_path: Path) -> None:
