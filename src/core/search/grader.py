@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import date, datetime, timezone
 import math
 import re
 from typing import Any
 
 from src.core.search.source_utils import canonical_source_id
+
+
+def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return max(minimum, min(maximum, float(value)))
 
 
 class ResultGrader:
@@ -18,6 +23,44 @@ class ResultGrader:
         "/length",
         "obj",
     )
+    _ACTIONABLE_MARKERS = (
+        "需要",
+        "应当",
+        "建议",
+        "步骤",
+        "要求",
+        "不得",
+        "必须",
+        "应该",
+        "should",
+        "must",
+        "required",
+    )
+    _CONFLICT_RESTRICT_MARKERS = ("禁止", "限制", "下架", "封禁", "ban", "restriction", "penalty")
+    _CONFLICT_RELAX_MARKERS = ("允许", "放宽", "恢复", "支持", "allow", "approved")
+    _LOW_AUTHORITY_DOMAIN_MARKERS = ("forum", "bbs", "weibo", "zhihu", "reddit", "blog")
+    _HIGH_AUTHORITY_DOMAIN_MARKERS = (
+        ".gov",
+        ".edu",
+        ".org",
+        "docs.",
+        "official",
+        "openai.com",
+        "wikipedia.org",
+    )
+
+    def __init__(
+        self,
+        *,
+        min_evidence_score: float = 0.26,
+        min_freshness_temporal: float = 0.32,
+        conflict_pool_threshold: float = 0.82,
+    ) -> None:
+        self.min_evidence_score = _clamp(min_evidence_score)
+        self.min_freshness_temporal = _clamp(min_freshness_temporal)
+        self.conflict_pool_threshold = _clamp(conflict_pool_threshold)
+        self.last_hard_filtered: list[dict[str, Any]] = []
+        self.last_conflict_pool: list[dict[str, Any]] = []
 
     def grade(
         self,
@@ -25,10 +68,14 @@ class ResultGrader:
         query_tokens: list[str],
         query_theme_hints: list[str] | None = None,
         fused_results: list[dict[str, Any]],
+        query_intent: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        self.last_hard_filtered = []
+        self.last_conflict_pool = []
         if not fused_results:
             return [], []
 
+        temporal_query = self._is_temporal_query(query_tokens=query_tokens, query_intent=query_intent)
         max_rrf = max((float(item.get("rrf_score", 0.0)) for item in fused_results), default=1.0)
         max_similarity = max(
             (max(0.0, float(item.get("vec_similarity", 0.0))) for item in fused_results),
@@ -63,13 +110,29 @@ class ResultGrader:
             )
 
             readability_score = self._readability_score(content)
-            short_penalty = 0.15 if len(content.strip()) < 40 else 0.0
+            relevance_score = _clamp(
+                0.42 * overlap + 0.24 * lexical_norm + 0.24 * semantic_norm + 0.10 * metadata_boost
+            )
+            evidence_score = self._evidence_score(
+                content=content,
+                readability_score=readability_score,
+                overlap_score=overlap,
+            )
+            freshness_score = self._freshness_score(item)
+            source_key = str(item.get("source", ""))
+            source_path = str(item.get("source_path", ""))
             doc_type = str(item.get("doc_type", "text")).lower()
+            authority_score = self._authority_score(
+                source=source_key,
+                source_path=source_path,
+                section_title=str(item.get("section_title", "")),
+            )
+
+            short_penalty = 0.15 if len(content.strip()) < 40 else 0.0
             pdf_noise_penalty = 0.25 * (1.0 - readability_score) if doc_type == "pdf" else 0.0
             general_noise_penalty = 0.08 * (1.0 - readability_score)
             noise_penalty = short_penalty + pdf_noise_penalty + general_noise_penalty
-            source_key = str(item.get("source", ""))
-            source_path = str(item.get("source_path", ""))
+
             source_theme_boost = self._source_theme_boost(
                 source=source_key,
                 source_path=source_path,
@@ -82,15 +145,20 @@ class ResultGrader:
             redundancy_penalty = 0.15 if prior_score > 0.75 else 0.0
 
             candidate_score = (
-                0.30 * rrf_norm
-                + 0.20 * lexical_norm
-                + 0.25 * semantic_norm
-                + 0.15 * overlap
-                + 0.10 * metadata_boost
+                0.22 * rrf_norm
+                + 0.15 * lexical_norm
+                + 0.17 * semantic_norm
+                + 0.12 * overlap
+                + 0.08 * metadata_boost
+                + 0.10 * relevance_score
+                + 0.12 * evidence_score
+                + 0.08 * freshness_score
+                + 0.06 * authority_score
                 + source_theme_boost
                 - redundancy_penalty
                 - noise_penalty
             )
+            stance = self._conflict_stance(content_lower)
             pre_scored.append(
                 {
                     **item,
@@ -107,12 +175,64 @@ class ResultGrader:
                     "_rrf_norm": rrf_norm,
                     "_metadata_boost": metadata_boost,
                     "_source_theme_boost": source_theme_boost,
+                    "_relevance_score": relevance_score,
+                    "_evidence_score": evidence_score,
+                    "_freshness_score": freshness_score,
+                    "_authority_score": authority_score,
+                    "_conflict_stance": stance,
+                    "_conflict_risk": 0.0,
                 }
             )
             content_hash_to_top_score[content_hash] = max(prior_score, candidate_score)
 
-        source_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        has_restrict = any(int(item.get("_conflict_stance", 0)) < 0 for item in pre_scored)
+        has_relax = any(int(item.get("_conflict_stance", 0)) > 0 for item in pre_scored)
+        has_conflict = has_restrict and has_relax
+        filtered_pre_scored: list[dict[str, Any]] = []
         for item in pre_scored:
+            authority_score = float(item.get("_authority_score", 0.0))
+            stance = int(item.get("_conflict_stance", 0))
+            if has_conflict and stance != 0:
+                conflict_risk = _clamp(0.78 + 0.16 * (1.0 - authority_score))
+            else:
+                conflict_risk = _clamp(0.12 + 0.18 * (1.0 - authority_score))
+            item["_conflict_risk"] = conflict_risk
+            item["_candidate_score"] = float(item["_candidate_score"]) - 0.10 * conflict_risk
+
+            evidence_score = float(item.get("_evidence_score", 0.0))
+            freshness_score = float(item.get("_freshness_score", 0.0))
+            reason = ""
+            if evidence_score < self.min_evidence_score:
+                reason = "evidence_below_threshold"
+            elif temporal_query and freshness_score < self.min_freshness_temporal:
+                reason = "freshness_below_threshold_for_temporal_query"
+            elif conflict_risk >= self.conflict_pool_threshold:
+                reason = "high_conflict_risk_pool"
+
+            if not reason:
+                filtered_pre_scored.append(item)
+                continue
+
+            row = {
+                "file_uuid": str(item.get("file_uuid", "")),
+                "chunk_id": int(item.get("chunk_id", 0)),
+                "source": str(item.get("source", "")),
+                "reason": reason,
+                "evidence_score": round(evidence_score, 6),
+                "freshness_score": round(freshness_score, 6),
+                "authority_score": round(authority_score, 6),
+                "conflict_risk": round(conflict_risk, 6),
+            }
+            if reason == "high_conflict_risk_pool":
+                self.last_conflict_pool.append(row)
+            else:
+                self.last_hard_filtered.append(row)
+
+        if not filtered_pre_scored:
+            return [], []
+
+        source_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in filtered_pre_scored:
             source_groups[str(item.get("source", ""))].append(item)
 
         doc_evidence_mass_by_source: dict[str, float] = {}
@@ -144,13 +264,14 @@ class ResultGrader:
         size_quality_norm = self._minmax_normalize(size_quality)
 
         candidate_results: list[dict[str, Any]] = []
-        for item in pre_scored:
+        for item in filtered_pre_scored:
             source = str(item.get("source", ""))
             candidate_score = float(item["_candidate_score"])
             final_score = (
-                0.65 * candidate_score
-                + 0.25 * evidence_mass_norm.get(source, 0.0)
+                0.58 * candidate_score
+                + 0.22 * evidence_mass_norm.get(source, 0.0)
                 + 0.10 * size_quality_norm.get(source, 0.0)
+                + 0.10 * float(item.get("_authority_score", 0.0))
             )
             graded = {
                 **item,
@@ -162,12 +283,18 @@ class ResultGrader:
                     "metadata_boost": round(float(item["_metadata_boost"]), 6),
                     "source_theme_boost": round(float(item["_source_theme_boost"]), 6),
                     "readability_score": round(float(item["_readability_score"]), 6),
+                    "relevance_score": round(float(item["_relevance_score"]), 6),
+                    "evidence_score": round(float(item["_evidence_score"]), 6),
+                    "freshness_score": round(float(item["_freshness_score"]), 6),
+                    "authority_score": round(float(item["_authority_score"]), 6),
+                    "conflict_risk": round(float(item["_conflict_risk"]), 6),
                     "redundancy_penalty": round(float(item["_redundancy_penalty"]), 6),
                     "noise_penalty": round(float(item["_noise_penalty"]), 6),
                     "candidate_score": round(candidate_score, 6),
                     "doc_evidence_mass_norm": round(evidence_mass_norm.get(source, 0.0), 6),
                     "doc_size_quality_norm": round(size_quality_norm.get(source, 0.0), 6),
                     "final_score": round(final_score, 6),
+                    "hard_filter_passed": True,
                 },
                 "score": final_score,
             }
@@ -182,6 +309,12 @@ class ResultGrader:
                 "_rrf_norm",
                 "_metadata_boost",
                 "_source_theme_boost",
+                "_relevance_score",
+                "_evidence_score",
+                "_freshness_score",
+                "_authority_score",
+                "_conflict_stance",
+                "_conflict_risk",
             ):
                 graded.pop(key, None)
             candidate_results.append(graded)
@@ -200,12 +333,16 @@ class ResultGrader:
             second_score = float(ranked_items[1]["score"]) if len(ranked_items) > 1 else 0.0
             coverage = min(1.0, len(items) / 3.0)
             citation_readiness = 1.0 if source and ranked_items[0].get("source_path") else 0.7
+            authority_mean = sum(
+                float(row.get("grading", {}).get("authority_score", 0.0)) for row in ranked_items[:3]
+            ) / max(min(len(ranked_items), 3), 1)
             source_score = (
-                0.40 * top_score
-                + 0.20 * second_score
-                + 0.15 * coverage
-                + 0.10 * citation_readiness
-                + 0.15 * evidence_mass_norm.get(source, 0.0)
+                0.32 * top_score
+                + 0.18 * second_score
+                + 0.12 * coverage
+                + 0.1 * citation_readiness
+                + 0.16 * evidence_mass_norm.get(source, 0.0)
+                + 0.12 * authority_mean
             )
             source_results.append(
                 {
@@ -256,7 +393,117 @@ class ResultGrader:
         readability_ratio = len(readable_chars) / max(len(text), 1)
         noise_ratio = min(1.0, noise_hits / max(len(text) / 80.0, 1.0))
         score = 0.75 * readability_ratio + 0.25 * (1.0 - noise_ratio)
-        return max(0.0, min(1.0, score))
+        return _clamp(score)
+
+    def _evidence_score(self, *, content: str, readability_score: float, overlap_score: float) -> float:
+        text = str(content or "").strip()
+        if not text:
+            return 0.0
+        length_score = min(1.0, len(text) / 240.0)
+        token_pool = re.findall(r"[a-z0-9\u4e00-\u9fff]", text.lower())
+        unique_density = len(set(token_pool)) / max(len(token_pool), 1)
+        actionable_hits = sum(1 for marker in self._ACTIONABLE_MARKERS if marker in text.lower())
+        actionable_score = min(1.0, actionable_hits / 3.0)
+        date_anchor = 1.0 if re.search(r"20\d{2}[-/年](0?[1-9]|1[0-2])", text) else 0.0
+        return _clamp(
+            0.30 * readability_score
+            + 0.20 * length_score
+            + 0.20 * unique_density
+            + 0.20 * actionable_score
+            + 0.05 * overlap_score
+            + 0.05 * date_anchor
+        )
+
+    def _freshness_score(self, item: dict[str, Any]) -> float:
+        candidates = [
+            str(item.get("published_at", "")).strip(),
+            str(item.get("updated_at", "")).strip(),
+            str(item.get("metadata", {}).get("published_at", "")).strip()
+            if isinstance(item.get("metadata"), dict)
+            else "",
+            str(item.get("source_path", "")).strip(),
+            str(item.get("source", "")).strip(),
+        ]
+        dates: list[date] = []
+        for text in candidates:
+            if not text:
+                continue
+            parsed = self._extract_date(text)
+            if parsed is not None:
+                dates.append(parsed)
+        if not dates:
+            return 0.55
+
+        newest = max(dates)
+        age_days = (datetime.now(timezone.utc).date() - newest).days
+        if age_days <= 30:
+            return 1.0
+        if age_days <= 90:
+            return 0.82
+        if age_days <= 180:
+            return 0.66
+        if age_days <= 365:
+            return 0.48
+        return 0.26
+
+    def _extract_date(self, text: str) -> date | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        for candidate in re.findall(r"20\d{2}[-/年](?:0?[1-9]|1[0-2])[-/月](?:0?[1-9]|[12]\d|3[01])", raw):
+            normalized = candidate.replace("年", "-").replace("月", "-").replace("日", "")
+            normalized = normalized.replace("/", "-")
+            try:
+                return date.fromisoformat(normalized)
+            except Exception:
+                continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except Exception:
+            pass
+        if len(raw) >= 10:
+            try:
+                return date.fromisoformat(raw[:10].replace("/", "-"))
+            except Exception:
+                return None
+        return None
+
+    def _authority_score(self, *, source: str, source_path: str, section_title: str) -> float:
+        joined = " ".join([str(source).lower(), str(source_path).lower(), str(section_title).lower()]).strip()
+        if not joined:
+            return 0.3
+        if any(marker in joined for marker in self._HIGH_AUTHORITY_DOMAIN_MARKERS):
+            return 0.88
+        if any(marker in joined for marker in self._LOW_AUTHORITY_DOMAIN_MARKERS):
+            return 0.45
+        if source_path.startswith(("http://", "https://")):
+            return 0.72
+        if source_path:
+            return 0.68
+        return 0.58
+
+    def _conflict_stance(self, lowered_content: str) -> int:
+        has_restrict = any(marker in lowered_content for marker in self._CONFLICT_RESTRICT_MARKERS)
+        has_relax = any(marker in lowered_content for marker in self._CONFLICT_RELAX_MARKERS)
+        if has_restrict and not has_relax:
+            return -1
+        if has_relax and not has_restrict:
+            return 1
+        return 0
+
+    def _is_temporal_query(
+        self,
+        *,
+        query_tokens: list[str],
+        query_intent: dict[str, Any] | None,
+    ) -> bool:
+        if isinstance(query_intent, dict):
+            temporal_terms = query_intent.get("temporal_terms", [])
+            if isinstance(temporal_terms, list) and any(str(item).strip() for item in temporal_terms):
+                return True
+        lowered_tokens = [str(token).lower() for token in query_tokens]
+        markers = {"最新", "最近", "近期", "本周", "本月", "今年", "latest", "recent", "today"}
+        return any(marker in token for token in lowered_tokens for marker in markers)
 
     def _source_theme_boost(
         self,

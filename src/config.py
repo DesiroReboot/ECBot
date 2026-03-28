@@ -58,7 +58,12 @@ def _strip_wrapped_quotes(value: str) -> str:
     return value
 
 
-def _load_dotenv_file(path: str = ".env") -> None:
+def _is_placeholder_env_value(value: str) -> bool:
+    normalized = _strip_wrapped_quotes(str(value)).strip().upper()
+    return bool(normalized) and normalized.startswith("YOUR_")
+
+
+def _load_dotenv_file(path: str = ".env", *, ignore_placeholders: bool = False) -> None:
     dotenv_path = Path(path)
     if not dotenv_path.exists() or not dotenv_path.is_file():
         return
@@ -76,6 +81,8 @@ def _load_dotenv_file(path: str = ".env") -> None:
         if not key:
             continue
         value = _strip_wrapped_quotes(value.strip())
+        if ignore_placeholders and _is_placeholder_env_value(value):
+            continue
         os.environ.setdefault(key, value)
 
 
@@ -91,7 +98,7 @@ def _load_env_layers() -> None:
     private_dotenv = os.getenv("ECBOT_DOTENV_PATH", _resolve_default_private_dotenv())
     # Private first so it has higher precedence; public template only backfills missing keys.
     _load_dotenv_file(private_dotenv)
-    _load_dotenv_file(".env.example")
+    _load_dotenv_file(".env.example", ignore_placeholders=True)
 
 
 @dataclass
@@ -101,6 +108,9 @@ class SearchConfig:
     vec_top_k: int = 20
     fusion_rrf_k: int = 60
     context_top_k: int = 6
+    domain_filter_enabled: bool = True
+    domain_filter_threshold: float = 0.45
+    domain_filter_fail_open: bool = True
     web_search_enabled: bool = False
     web_search_provider: str = "mock"
     web_search_timeout: int = 8
@@ -118,6 +128,7 @@ class SearchConfig:
         }
     )
     web_rag_max_docs: int = 16
+    phase_a_rag_confidence_threshold: float = 0.58
     search_progress_enabled: bool = True
     search_progress_keyword_top_k: int = 4
 
@@ -256,6 +267,26 @@ class Config:
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
             fusion_rrf_k=int(_env("ECBOT_FUSION_RRF_K", search_data.get("fusion_rrf_k", 60))),
             context_top_k=int(_env("ECBOT_CONTEXT_TOP_K", search_data.get("context_top_k", 6))),
+            domain_filter_enabled=_as_bool(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_ENABLED",
+                    search_data.get("domain_filter_enabled", True),
+                ),
+                True,
+            ),
+            domain_filter_threshold=float(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_THRESHOLD",
+                    search_data.get("domain_filter_threshold", 0.45),
+                )
+            ),
+            domain_filter_fail_open=_as_bool(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_FAIL_OPEN",
+                    search_data.get("domain_filter_fail_open", True),
+                ),
+                True,
+            ),
             web_search_enabled=_as_bool(
                 _env("ECBOT_WEB_SEARCH_ENABLED", search_data.get("web_search_enabled", False)),
                 False,
@@ -316,6 +347,12 @@ class Config:
             },
             web_rag_max_docs=int(
                 _env("ECBOT_WEB_RAG_MAX_DOCS", search_data.get("web_rag_max_docs", 16))
+            ),
+            phase_a_rag_confidence_threshold=float(
+                _env(
+                    "ECBOT_PHASE_A_RAG_CONFIDENCE_THRESHOLD",
+                    search_data.get("phase_a_rag_confidence_threshold", 0.58),
+                )
             ),
             search_progress_enabled=_as_bool(
                 _env(

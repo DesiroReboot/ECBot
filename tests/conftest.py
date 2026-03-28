@@ -10,6 +10,7 @@ from uuid import uuid4
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("ECBOT_DOTENV_PATH", str(PROJECT_ROOT / ".env.test"))
 LOCAL_TMP = PROJECT_ROOT / "DB" / "tmp_runtime"
 LOCAL_TMP.mkdir(parents=True, exist_ok=True)
 
@@ -40,6 +41,24 @@ def _safe_mkdtemp(
 
 
 tempfile.mkdtemp = _safe_mkdtemp
+
+_ORIGINAL_PATH_MKDIR = Path.mkdir
+
+
+def _safe_path_mkdir(
+    self: Path,
+    mode: int = 0o777,
+    parents: bool = False,
+    exist_ok: bool = False,
+) -> None:
+    adjusted_mode = mode
+    if os.name == "nt" and int(mode) == 0o700 and "pytest" in str(self).lower():
+        # On some Windows volumes, mode=0o700 creates directories that cannot be listed/deleted.
+        adjusted_mode = 0o777
+    _ORIGINAL_PATH_MKDIR(self, mode=adjusted_mode, parents=parents, exist_ok=exist_ok)
+
+
+Path.mkdir = _safe_path_mkdir
 
 _ORIGINAL_RMTREE = shutil.rmtree
 

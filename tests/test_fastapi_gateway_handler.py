@@ -146,7 +146,8 @@ def test_self_check_and_fullchain_visualize(tmp_path: Path) -> None:
     assert fullchain_ts.utcoffset() == timedelta(0)
 
 
-def test_url_verification_token_check(tmp_path: Path) -> None:
+def test_url_verification_token_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ECBOT_FEISHU_VERIFICATION_TOKEN", "verify-token")
     cfg = _build_config(tmp_path)
     app = create_app(cfg)
     app.state.event_service.agent = _DummyAgent()
@@ -222,6 +223,39 @@ def test_event_reply_pipeline_sends_progress_before_final_when_search_needed(tmp
     assert len(api.reply_texts) == 2
     assert api.reply_texts[0].startswith("正在搜索：")
     assert api.reply_texts[1] == "ok"
+
+
+def test_progress_text_prefers_entities_and_intent_terms(tmp_path: Path) -> None:
+    cfg = _build_config(
+        tmp_path,
+        extra={"search": {"web_search_enabled": True, "search_progress_enabled": True}},
+    )
+    app = create_app(cfg)
+    app.state.event_service.agent = _DummyAgent()
+    api = _DummyAPIClient()
+    app.state.event_service.api_client = api
+
+    client = TestClient(app)
+    resp = client.post(
+        "/webhook/feishu",
+        json={
+            "type": "event_callback",
+            "event": {
+                "message": {
+                    "message_id": "om_progress_entity",
+                    "text": "在最新的平台政策下，如何打造类似 哭哭马 拉布布 的爆款",
+                },
+                "sender": {"sender_type": "user"},
+            },
+        },
+    )
+    assert resp.status_code == 200
+    assert len(api.reply_texts) == 2
+    progress = api.reply_texts[0]
+    assert progress.startswith("正在搜索：")
+    assert "哭哭马" in progress
+    assert "拉布布" in progress
+    assert "在最" not in progress
 
 
 def test_duplicate_event_callback_is_ignored(tmp_path: Path) -> None:

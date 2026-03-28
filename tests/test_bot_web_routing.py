@@ -111,7 +111,7 @@ def test_run_sync_applies_direct_fusion_and_writes_web_trace() -> None:
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
     assert web_trace["fusion_strategy"] == "direct_fusion"
-    assert web_trace["fallback"] is False
+    assert web_trace["fallback_used"] is False
     assert web_trace["metrics"]["result_count"] == 3
 
 
@@ -122,7 +122,7 @@ def test_run_sync_fallbacks_to_local_when_web_empty() -> None:
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
     assert web_trace["fusion_strategy"] == "none"
-    assert web_trace["fallback"] is True
+    assert web_trace["fallback_used"] is True
     assert "web_no_results" in web_trace["reasons"]
 
 
@@ -141,7 +141,7 @@ def test_kb_empty_auto_triggers_web_fallback_chain() -> None:
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
     assert "kb_empty_triggered_web_fallback" in web_trace["reasons"]
-    assert web_trace["fallback"] is False
+    assert web_trace["fallback_used"] is False
     assert all(step.get("stage") != "fallback_answer" for step in response.trace["strategy_execution"])
 
 
@@ -156,7 +156,32 @@ def test_web_provider_error_records_reason_and_returns_safe_fallback() -> None:
 
     web_trace = response.trace["search"]["web"]
     assert web_trace["need_web_search"] is True
-    assert web_trace["fallback"] is True
+    assert web_trace["fallback_used"] is True
     assert "web_search_error" in web_trace["reasons"]
     assert "provider_misconfigured" in web_trace["reasons"]
     assert any(step.get("stage") == "fallback_answer" for step in response.trace["strategy_execution"])
+
+
+def test_run_sync_legacy_web_fallback_field_is_read_once() -> None:
+    agent = _build_agent(web_enabled=False, web_results=[])
+    agent.search_orchestrator = SimpleNamespace(
+        search_with_trace=lambda query: SimpleNamespace(  # noqa: ARG005
+            hits=[_local_result()],
+            citations=[],
+            retrieval_confidence=0.7,
+            trace_search={
+                "web": {
+                    "need_web_search": True,
+                    "fusion_strategy": "none",
+                    "reasons": ["legacy"],
+                    "metrics": {},
+                    "fallback": True,
+                }
+            },
+        )
+    )
+
+    response = agent.run_sync("legacy trace", include_trace=True)
+    web_trace = response.trace["search"]["web"]
+    assert web_trace["fallback_used"] is True
+    assert response.trace["search"]["compat"]["trace_web_fallback_legacy_read"] is True

@@ -29,6 +29,7 @@ def test_search_config_reads_tavily_env_and_provider(monkeypatch) -> None:
     monkeypatch.setenv("ECBOT_WEB_SEARCH_MAX_RESULTS", "12")
     monkeypatch.setenv("ECBOT_WEB_SEARCH_DEPTH", "advanced")
     monkeypatch.setenv("ECBOT_WEB_SEARCH_RETRIES", "3")
+    monkeypatch.setenv("ECBOT_PHASE_A_RAG_CONFIDENCE_THRESHOLD", "0.66")
 
     cfg = Config(str(config_path))
 
@@ -37,6 +38,7 @@ def test_search_config_reads_tavily_env_and_provider(monkeypatch) -> None:
     assert cfg.search.web_search_max_results == 12
     assert cfg.search.web_search_depth == "advanced"
     assert cfg.search.web_search_retries == 3
+    assert cfg.search.phase_a_rag_confidence_threshold == 0.66
 
 
 def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
@@ -45,6 +47,7 @@ def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
     monkeypatch.delenv("ECBOT_WEB_SEARCH_DEPTH", raising=False)
     monkeypatch.delenv("ECBOT_WEB_SEARCH_MAX_RESULTS", raising=False)
     monkeypatch.delenv("ECBOT_WEB_SEARCH_RETRIES", raising=False)
+    monkeypatch.delenv("ECBOT_PHASE_A_RAG_CONFIDENCE_THRESHOLD", raising=False)
 
     cfg = Config(str(config_path))
 
@@ -53,3 +56,4 @@ def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
     assert cfg.search.web_search_max_results == 8
     assert cfg.search.web_search_depth == "basic"
     assert cfg.search.web_search_retries == 1
+    assert cfg.search.phase_a_rag_confidence_threshold == 0.58

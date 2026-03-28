@@ -90,6 +90,7 @@ class RAGSearcher:
                 query_tokens=list(preprocess["tokens"]),
                 query_theme_hints=list(preprocess.get("theme_hints", [])),
                 fused_results=fused,
+                query_intent=dict(preprocess.get("query_intent", {})),
             )
             selected, citations = self.context_selector.select(
                 candidates=candidates,
@@ -142,6 +143,8 @@ class RAGSearcher:
                     },
                     "branch_contribution": {},
                     "eliminated_candidates": [],
+                    "hard_filtered_candidates": list(getattr(self.grader, "last_hard_filtered", [])),
+                    "conflict_pool_candidates": list(getattr(self.grader, "last_conflict_pool", [])),
                 },
                 "generation": {
                     "error": str(exc),
@@ -216,6 +219,8 @@ class RAGSearcher:
                 fused_results=fused,
                 candidate_results=candidates,
                 selected_results=selected,
+                hard_filtered=list(getattr(self.grader, "last_hard_filtered", [])),
+                conflict_pool=list(getattr(self.grader, "last_conflict_pool", [])),
             ),
             "generation": {
                 "selected_count": len(results),
@@ -249,6 +254,8 @@ class RAGSearcher:
         fused_results: list[dict[str, Any]],
         candidate_results: list[dict[str, Any]],
         selected_results: list[dict[str, Any]],
+        hard_filtered: list[dict[str, Any]] | None = None,
+        conflict_pool: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         def _key(item: dict[str, Any]) -> tuple[str, int]:
             return (str(item.get("file_uuid", "")), int(item.get("chunk_id", 0)))
@@ -328,8 +335,12 @@ class RAGSearcher:
                 "fused_total": len(fused_results),
                 "selected_total": len(selected_results),
                 "eliminated_total": len(eliminated_candidates),
+                "hard_filtered_total": len(hard_filtered or []),
+                "conflict_pool_total": len(conflict_pool or []),
                 "source_quotas": source_quotas,
             },
             "branch_contribution": branch_contribution,
             "eliminated_candidates": eliminated_candidates,
+            "hard_filtered_candidates": list(hard_filtered or []),
+            "conflict_pool_candidates": list(conflict_pool or []),
         }

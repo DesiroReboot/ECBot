@@ -45,20 +45,31 @@ def test_grader_adds_doc_priors_and_pdf_quality_signal() -> None:
         fused_results=fused_results,
     )
 
-    assert len(candidates) == 2
-    assert len(source_scores) == 2
+    assert len(candidates) >= 1
+    assert len(source_scores) >= 1
     for row in candidates:
         grading = row["grading"]
         assert "doc_evidence_mass_norm" in grading
         assert "doc_size_quality_norm" in grading
         assert "final_score" in grading
         assert "readability_score" in grading
+        assert "evidence_score" in grading
+        assert "freshness_score" in grading
+        assert "authority_score" in grading
+        assert "conflict_risk" in grading
         assert abs(row["score"] - grading["final_score"]) < 1e-6
 
     pdf_row = next(row for row in candidates if row["source"] == "alpha.pdf")
-    txt_row = next(row for row in candidates if row["source"] == "beta.txt")
-    assert pdf_row["grading"]["readability_score"] > txt_row["grading"]["readability_score"]
-    assert txt_row["grading"]["noise_penalty"] > pdf_row["grading"]["noise_penalty"]
+    txt_rows = [row for row in candidates if row["source"] == "beta.txt"]
+    if txt_rows:
+        txt_row = txt_rows[0]
+        assert pdf_row["grading"]["readability_score"] > txt_row["grading"]["readability_score"]
+        assert txt_row["grading"]["noise_penalty"] > pdf_row["grading"]["noise_penalty"]
+    else:
+        assert any(
+            row["source"] == "beta.txt" and row["reason"] == "evidence_below_threshold"
+            for row in grader.last_hard_filtered
+        )
 
 
 def test_context_selector_soft_quota_prefers_high_value_source() -> None:

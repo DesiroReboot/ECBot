@@ -27,6 +27,7 @@ def test_query_analyzer_triggers_for_temporal_intent() -> None:
     assert analysis.need_web_search is True
     assert analysis.temporal_intent_score >= 0.6
     assert "temporal_intent_high" in analysis.reasons
+    assert analysis.route_mode in {"hybrid", "web_dominant"}
 
 
 def test_query_analyzer_triggers_for_domain_oov_pair() -> None:
@@ -61,3 +62,23 @@ def test_query_analyzer_triggers_for_low_kb_coverage() -> None:
     assert analysis.need_web_search is True
     assert "kb_no_hit" in analysis.reasons
     assert "kb_coverage_low" in analysis.reasons
+
+
+def test_query_analyzer_web_dominant_for_latest_policy_with_new_entities() -> None:
+    analyzer = QueryAnalyzer()
+    analysis = analyzer.analyze(
+        query="在最新的平台政策下，如何打造类似 哭哭马 拉布布 的爆款",
+        local_results=[
+            _result(
+                source="policy-guide.md",
+                content="平台合规策略总览，强调审核与广告投放节奏。",
+                score=0.65,
+            )
+        ],
+        search_trace={},
+    )
+
+    assert analysis.need_web_search is True
+    assert analysis.route_mode == "web_dominant"
+    assert "temporal_intent_high" in analysis.reasons
+    assert "policy_temporal_trigger" in analysis.reasons

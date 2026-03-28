@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
-from src.core.search.query_preprocessor import QueryPreprocessor
+from src.core.search.query_preprocessor import QueryIntent, QueryPreprocessor
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -19,15 +19,29 @@ class QueryAnalysis:
     kb_coverage_score: float
     need_web_search: bool
     reasons: list[str] = field(default_factory=list)
+    route_mode: str = "kb_only"
+    query_intent: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        signals = {
             "temporal_intent_score": round(float(self.temporal_intent_score), 6),
             "domain_relevance_score": round(float(self.domain_relevance_score), 6),
             "oov_entity_score": round(float(self.oov_entity_score), 6),
             "kb_coverage_score": round(float(self.kb_coverage_score), 6),
+        }
+        reason_codes = list(self.reasons)
+        return {
+            "signals": signals,
+            "reason_codes": reason_codes,
             "need_web_search": bool(self.need_web_search),
-            "reasons": list(self.reasons),
+            "route_mode": str(self.route_mode or "kb_only"),
+            "query_intent": dict(self.query_intent),
+            # Compatibility fields for legacy readers.
+            "temporal_intent_score": signals["temporal_intent_score"],
+            "domain_relevance_score": signals["domain_relevance_score"],
+            "oov_entity_score": signals["oov_entity_score"],
+            "kb_coverage_score": signals["kb_coverage_score"],
+            "reasons": reason_codes,
         }
 
 
@@ -111,18 +125,24 @@ class QueryAnalyzer:
     ) -> QueryAnalysis:
         preprocess = self.preprocessor.process(query)
         lowered = str(preprocess.get("lowered", ""))
-        query_tokens = [str(token) for token in preprocess.get("tokens", []) if str(token).strip()]
+        intent = self._coerce_query_intent(preprocess.get("query_intent", {}))
+        query_tokens = self._query_tokens(
+            intent=intent,
+            preprocess_tokens=[str(token) for token in preprocess.get("tokens", []) if str(token).strip()],
+        )
         theme_hints = [str(item) for item in preprocess.get("theme_hints", []) if str(item).strip()]
         local_rows = self._coerce_local_rows(local_results)
-        entity_candidates = self._extract_entity_candidates(query)
 
-        temporal_score = self._temporal_intent_score(lowered)
+        temporal_score = self._temporal_intent_score(lowered=lowered, intent=intent)
         domain_score = self._domain_relevance_score(
             lowered=lowered,
             theme_hints=theme_hints,
-            entities=entity_candidates,
+            intent=intent,
         )
-        oov_score = self._oov_entity_score(entities=entity_candidates, local_rows=local_rows)
+        oov_score = self._oov_entity_score(
+            entities=list(intent.get("core_entities", [])),
+            local_rows=local_rows,
+        )
         kb_coverage_score = self._kb_coverage_score(
             query_tokens=query_tokens,
             local_rows=local_rows,
@@ -138,14 +158,32 @@ class QueryAnalyzer:
             reasons.append("domain_oov_trigger")
         if kb_coverage_score < 0.35:
             reasons.append("kb_coverage_low")
+        if temporal_score >= 0.45 and self._is_policy_query(intent, lowered):
+            reasons.append("policy_temporal_trigger")
+        if intent.get("core_entities") and oov_score >= 0.75:
+            reasons.append("new_entity_oov_high")
+
+        need_web_search = bool(reasons) or bool(intent.get("need_web_search", False))
+        route_mode = self._route_mode(
+            temporal_score=temporal_score,
+            oov_score=oov_score,
+            kb_coverage_score=kb_coverage_score,
+            need_web_search=need_web_search,
+            local_rows=local_rows,
+            intent_route=str(intent.get("route_mode", "kb_only")),
+        )
+        if route_mode == "web_dominant":
+            reasons.append("route_web_dominant")
 
         return QueryAnalysis(
             temporal_intent_score=temporal_score,
             domain_relevance_score=domain_score,
             oov_entity_score=oov_score,
             kb_coverage_score=kb_coverage_score,
-            need_web_search=bool(reasons),
+            need_web_search=need_web_search,
             reasons=reasons,
+            route_mode=route_mode,
+            query_intent=dict(intent),
         )
 
     def _coerce_local_rows(self, local_results: list[Any]) -> list[dict[str, Any]]:
@@ -169,8 +207,9 @@ class QueryAnalyzer:
             )
         return rows
 
-    def _temporal_intent_score(self, lowered: str) -> float:
+    def _temporal_intent_score(self, *, lowered: str, intent: QueryIntent) -> float:
         hits = sum(1 for keyword in self._TEMPORAL_KEYWORDS if keyword in lowered)
+        hits += len(intent.get("temporal_terms", []))
         if hits >= 2:
             return 0.85
         if hits == 1:
@@ -184,10 +223,15 @@ class QueryAnalyzer:
         *,
         lowered: str,
         theme_hints: list[str],
-        entities: list[str],
+        intent: QueryIntent,
     ) -> float:
+        entities = list(intent.get("core_entities", []))
         action_hits = sum(1 for token in self._DOMAIN_ACTION_KEYWORDS if token in lowered)
         context_hits = sum(1 for token in self._DOMAIN_CONTEXT_KEYWORDS if token in lowered)
+        action_hits += len(intent.get("intent_terms", []))
+        context_hits += sum(
+            1 for term in intent.get("constraint_terms", []) if term in {"平台政策", "政策", "合规", "规则", "监管"}
+        )
         theme_bonus = min(len(theme_hints), 2) * 0.12
         entity_bonus = 0.26 if entities else 0.0
         co_occurrence_bonus = 0.28 if action_hits > 0 and (context_hits > 0 or entities) else 0.0
@@ -246,33 +290,79 @@ class QueryAnalyzer:
         score = 0.55 * avg_score + 0.3 * token_coverage + 0.15 * source_diversity - penalty
         return _clamp(score)
 
-    def _extract_entity_candidates(self, query: str) -> list[str]:
-        candidates: list[str] = []
+    def _route_mode(
+        self,
+        *,
+        temporal_score: float,
+        oov_score: float,
+        kb_coverage_score: float,
+        need_web_search: bool,
+        local_rows: list[dict[str, Any]],
+        intent_route: str,
+    ) -> str:
+        if not need_web_search:
+            return "kb_only"
+        if not local_rows:
+            return "web_dominant"
+        if temporal_score >= 0.75:
+            return "web_dominant"
+        if oov_score >= 0.72 and kb_coverage_score <= 0.45:
+            return "web_dominant"
+        if intent_route == "web_dominant" and temporal_score >= 0.5:
+            return "web_dominant"
+        return "hybrid"
 
-        for raw_span in re.findall(r"[\u4e00-\u9fff]{2,16}", query):
-            span = raw_span
-            for token in self._ENTITY_STOPWORDS:
-                span = span.replace(token, " ")
-            for part in re.split(r"\s+", span):
-                normalized = part.strip()
-                if len(normalized) < 2:
-                    continue
-                if normalized in self._ENTITY_STOPWORDS:
-                    continue
-                candidates.append(normalized)
+    def _is_policy_query(self, intent: QueryIntent, lowered: str) -> bool:
+        constraints = set(str(item) for item in intent.get("constraint_terms", []))
+        if constraints & {"平台政策", "政策", "合规", "监管", "规则", "法规"}:
+            return True
+        markers = ("政策", "合规", "监管", "规则", "法规", "policy", "compliance")
+        return any(marker in lowered for marker in markers)
 
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", query):
-            normalized = token.strip().lower()
-            if normalized in self._ENTITY_STOPWORDS:
-                continue
-            candidates.append(normalized)
-
+    def _query_tokens(self, *, intent: QueryIntent, preprocess_tokens: list[str]) -> list[str]:
+        merged = (
+            list(intent.get("core_entities", []))
+            + list(intent.get("intent_terms", []))
+            + list(intent.get("constraint_terms", []))
+            + preprocess_tokens
+        )
         deduped: list[str] = []
         seen: set[str] = set()
-        for candidate in candidates:
-            key = candidate.lower()
-            if key in seen:
+        for token in merged:
+            text = str(token).strip().lower()
+            if len(text) < 2:
                 continue
-            seen.add(key)
-            deduped.append(candidate)
-        return deduped[:8]
+            if text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        return deduped
+
+    def _coerce_query_intent(self, raw: Any) -> QueryIntent:
+        if not isinstance(raw, dict):
+            return {
+                "core_entities": [],
+                "intent_terms": [],
+                "constraint_terms": [],
+                "temporal_terms": [],
+                "need_web_search": False,
+                "route_mode": "kb_only",
+            }
+
+        def _list_value(key: str) -> list[str]:
+            value = raw.get(key, [])
+            if not isinstance(value, list):
+                return []
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        route_mode = str(raw.get("route_mode", "kb_only")).strip() or "kb_only"
+        if route_mode not in {"kb_only", "hybrid", "web_dominant"}:
+            route_mode = "kb_only"
+        return {
+            "core_entities": _list_value("core_entities"),
+            "intent_terms": _list_value("intent_terms"),
+            "constraint_terms": _list_value("constraint_terms"),
+            "temporal_terms": _list_value("temporal_terms"),
+            "need_web_search": bool(raw.get("need_web_search", False)),
+            "route_mode": route_mode,
+        }

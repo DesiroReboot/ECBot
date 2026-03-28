@@ -1,218 +1,150 @@
-# 全网搜索接入计划（兼容 ECBot 合并）
+# 全网搜索与RAG协同方案评审（外贸电商）
 
-更新时间：2026-03-22
+更新日期：2026-03-27
 
-## 1. 目标与范围
+## 1. 背景与目标
 
-针对这类问题：
-- 含强时效词：`最近`、`新政策`、`最新`、`今年`、`本月`等
-- 含知识库外实体：如 `拉布布`、`哭哭马`
+针对“哭哭马 / 拉布布 / 最新平台政策”这类问题，单靠本地RAG很容易出现两类误判：
 
-实现一个可控检索路由：
-1. 先判断“是否需要全网搜索”
-2. 执行全网搜索后，根据结果分布决定：
-- `直接融合`（Web 结果直接入生成融合）
-- `RAG-融合`（Web 结果先入临时RAG，再走现有 Hybrid/RRF/Grader/ContextSelector）
+1. 误把“热词实体”当成无关噪声。
+2. 在“最新/政策”问题上给出过期答案。
 
-不在本计划范围：
-- 不改动现有离线知识库构建主流程
-- 不重构现有 ReActAgent 生成逻辑
+目标是建立一个**可解释、可回退、成本可控**的检索路由：
+
+1. 先做基础安全过滤（仅不友善/不文明）。
+2. 再做语义规划（关键词提取 + 触发决策）。
+3. 在 RAG 与 Web 之间动态路由，确保召回和准确性平衡。
 
 ---
 
-## 2. 问题拆解
+## 2. 对原方案的评审结论
 
-### 2.1 问题1：LLM 无法稳定判别“拉布布”类词
+你提出的两种主路径都成立：
 
-目标不是让 LLM“猜”词义，而是做**多信号判别**：
-- A. 业务相关性（是否外贸电商语境）
-- B. 知识库覆盖性（相关但库内缺失）
-- C. 时效性（是否需要近期信息）
+1. `3.1 全量并行（RAG + Web）`
+2. `3.2 先RAG，必要时再Web`
 
-### 2.2 问题2：搜索返回规模不确定（海量 vs 精准）
+但都存在潜在风险，需要补齐“判别和预算约束”。
 
-需要一套路由规则，避免：
-- 结果很少却强行走 RAG（收益低）
-- 结果很多且噪声高却直接融合（幻觉风险高）
+### 2.1 主要风险点
 
----
+1. **Filter过窄导致脏查询进入后续链路**  
+仅过滤不文明词可能不足，仍会有“注入式/诱导式”查询进入 Planner。
 
-## 3. 方案总览
+2. **关键词提取不稳定**  
+若 Planner 只做“分词”，容易把泛词（平台、政策）权重打高，错过真正实体词（哭哭马、拉布布）。
 
-```mermaid
-flowchart TD
-    A[User Query] --> B[Query Analyzer]
-    B --> C{Need Web Search?}
-    C -- No --> D[Existing RAGSearcher]
-    C -- Yes --> E[Web Search]
-    E --> F[Web Result Evaluator]
-    F --> G{Route Decision}
-    G -- Direct Fusion --> H[Generation Fusion]
-    G -- RAG Fusion --> I[Ephemeral Web RAG Index]
-    I --> J[Hybrid/RRF/Grader/ContextSelector]
-    D --> H
-    J --> H
-```
+3. **LLM判别 Web 相关性存在波动**  
+“是否外贸电商相关”如果完全由 LLM 一次性判别，结果一致性不足，线上可重复性差。
+
+4. **并行方案成本不可控**  
+3.1 在高QPS下会显著增加延迟与调用费用，且对弱查询也触发Web，ROI偏低。
+
+5. **串行方案存在漏搜风险**  
+3.2 若 RAG 阈值设计过松，会“误判为已覆盖”而跳过Web，导致时效类问题答旧。
+
+6. **无明确兜底模板分层**  
+“both无结果”直接模板化会损伤体验，需区分“无结果/低置信/冲突结果”三种兜底。
 
 ---
 
-## 4. 核心判别设计（问题1）
+## 3. 更新后的选型建议（推荐）
 
-## 4.1 Query Analyzer（新增）
+推荐采用 **3.3 自适应混合路由（默认串行，条件并行）**：
 
-输出结构（建议）：
-- `temporal_intent_score`：时效意图分（0~1）
-- `domain_relevance_score`：外贸电商相关分（0~1）
-- `oov_entity_score`：疑似知识库外实体分（0~1）
-- `kb_coverage_score`：知识库可覆盖分（0~1）
-- `need_web_search`：最终是否触发全网搜索（bool）
-- `reasons`：触发原因列表（用于 trace）
+1. 默认执行 `RAG-first`（控制成本）。
+2. 命中高风险信号时升级为 `RAG + Web并行`（保障召回和时效）。
+3. 对 Web 结果做“规则+LLM 双层采信”，避免单点判别抖动。
 
-## 4.2 判别信号
+### 3.1 路由策略
 
-1. 时效信号（规则优先）
-- 命中词典：`最近/新政策/最新/近期/今年/本月/刚刚` 等
-- 命中后提高 `temporal_intent_score`
+`并行触发条件（任一满足）`：
 
-2. 领域相关信号（轻量分类）
-- 在 `QueryPreprocessor` 基础上，扩展外贸电商词表与类目词表
-- 若 query 中出现实体词 + 外贸动作词（选品/爆品/供应链/关税/平台政策）共现，提升 `domain_relevance_score`
+1. 查询含强时效词（最新/近期/本月/政策更新）。
+2. 查询含疑似OOV实体（如哭哭马、拉布布）且本地命中弱。
+3. 合规/政策类问答（要求高可追溯性）。
 
-3. OOV 实体信号
-- 对 query 中专有名词候选（中文连续词、英文品牌词）做检测
-- 若该词在本地索引 `source/title/chunk` 命中率低（或为0），提升 `oov_entity_score`
+`串行触发条件`：
 
-4. 知识库覆盖信号
-- 先执行一次低成本本地召回（如 `fts_top_k=5, vec_top_k=5`）
-- 用 topN 结果的 `score/overlap/source_diversity` 估计 `kb_coverage_score`
+1. 非时效、非政策、实体明确且RAG高置信。
+2. 历史已命中可复用缓存（query+time-window）。
 
-## 4.3 触发规则（建议阈值）
+### 3.2 Web采信策略（必须结构化）
 
-`need_web_search = True` 当满足任一：
-1. `temporal_intent_score >= 0.6`
-2. `domain_relevance_score >= 0.5` 且 `oov_entity_score >= 0.6`
-3. `kb_coverage_score < 0.35`
+Web结果进入生成前需同时满足：
 
-说明：该规则是“可解释优先”，避免把决策交给单次 LLM 判断。
+1. 规则层：`result_count / top3_mean / noise_ratio / domain_diversity` 达阈值。
+2. 语义层：LLM输出结构化判定（related / evidence / confidence / reasons）。
+3. 置信融合：`final_accept = rules_pass AND (llm_confidence >= threshold)`。
+
+若不采信，不进入最终答案证据池。
 
 ---
 
-## 5. 搜索结果路由设计（问题2）
+## 4. 对你当前1/2/3步骤的落地修订
 
-## 5.1 Web Result Evaluator（新增）
+## 4.1 Filter（修订）
 
-对搜索结果计算：
-- `result_count`：去重后文档数
-- `top1_score/top3_mean`：头部相关性
-- `score_gap`：`top1 - top5_mean`（判断是否精准）
-- `domain_diversity`：来源域名多样性
-- `freshness_ratio`：近期文档占比（如 90/180 天）
-- `noise_ratio`：低质量页面占比（广告页/聚合页/内容过短）
+保留“文明过滤”为主，但增加轻量防注入标记，不阻断，仅打标：
 
-## 5.2 路由规则
+1. `toxicity_block`（阻断）
+2. `prompt_injection_flag`（仅降权）
 
-走 `直接融合`（Direct Fusion），当：
-1. `result_count <= 8`
-2. `top3_mean` 高（如 >= 0.72）
-3. `score_gap` 明显（头部很准）
-4. `noise_ratio` 低（如 <= 0.25）
+## 4.2 Planner（修订）
 
-走 `RAG-融合`，当满足任一：
-1. `result_count > 8`（海量）
-2. 主题分散（`domain_diversity` 高、`score_gap` 小）
-3. 时效强但结论冲突（需要 chunk 级证据聚合）
-4. 需要可追溯引用（政策/合规类）
+Planner 不仅分词，还需要输出：
 
-兜底：
-- Web 检索失败时回落现有本地 RAG 流程，并在 trace 标记 `web_fallback=true`
+1. `core_entities`（高权重实体词）
+2. `intent_terms`（意图词，如打造/爆款/选品）
+3. `constraint_terms`（平台/政策/时效）
+4. `need_web_search` + `route_mode`（serial / parallel）
+
+## 4.3 检索编排（修订）
+
+采用 `Adaptive`：
+
+1. `serial`: 先RAG，低置信再Web。
+2. `parallel`: RAG与Web并发，按采信融合。
+3. `none`: 全部低置信时触发分层模板。
 
 ---
 
-## 6. 与现有代码的集成点
+## 5. 兜底模板分层（建议）
 
-基于当前链路：`RAGSearcher.search_with_trace -> ReActAgent.run_sync`
+不要只有一个“无结果模板”，改为三层：
 
-建议新增组件：
-1. `src/core/search/query_analyzer.py`
-2. `src/core/search/web_search_client.py`
-3. `src/core/search/web_result_evaluator.py`
-4. `src/core/search/web_router.py`
-
-在 `ReActAgent.run_sync` 增加路由编排：
-1. 先本地 `QueryAnalyzer`
-2. 决定是否调用 `WebSearchClient`
-3. 用 `WebRouter` 选择 `direct_fusion` 或 `rag_fusion`
-4. 输出统一 `trace.search.web` 字段
+1. `NO_EVIDENCE`：RAG/Web均无有效证据。
+2. `LOW_CONFIDENCE`：有证据但置信不足。
+3. `CONFLICTED_EVIDENCE`：来源结论冲突，需人工核验提示。
 
 ---
 
-## 7. Trace 与配置兼容（面向 ../ECBot merge）
+## 6. 选型对比（3.1 vs 3.2 vs 3.3）
 
-## 7.1 配置兼容策略（必须）
+1. `3.1 全并行`
+- 优点：召回强，时效稳。
+- 缺点：成本高、延迟高、噪声管理难。
 
-遵循现有配置风格：
-- 新增 `search.web_*` 配置，且默认关闭：
-  - `web_search_enabled=false`
-  - `web_search_provider`
-  - `web_search_timeout`
-  - `web_direct_fusion_thresholds`
-  - `web_rag_max_docs`
-- 新增环境变量前缀继续使用 `ECBOT_`
-- 所有新字段提供默认值，保证旧 `config.json` 无感升级
+2. `3.2 先RAG再Web`
+- 优点：成本低，实现简单。
+- 缺点：阈值稍松就漏搜，时效问题易失真。
 
-## 7.2 返回结构兼容策略
-
-不破坏现有 `AgentResponse` 与 `visualize_fullchain` 主结构，只追加：
-- `trace.search.web.need_web_search`
-- `trace.search.web.fusion_strategy` (`none/direct_fusion/rag_fusion`)
-- `trace.search.web.reasons`
-- `trace.search.web.metrics`
-- `trace.search.web.fallback`
-
-现有字段保持不变，避免影响 `tests/test_fastapi_gateway_*` 及上游调用方。
+3. `3.3 自适应混合（推荐）`
+- 优点：在时效与成本间平衡，可解释性更强。
+- 缺点：策略复杂度高于3.2，但可分阶段上线。
 
 ---
 
-## 8. 分阶段落地
+## 7. 分阶段上线建议
 
-### Phase 0（低风险上线）
-1. 仅实现 `QueryAnalyzer` + `need_web_search` 判别
-2. 命中后先走 `direct_fusion`（限制 topN）
-3. 打通 trace 与开关配置
-
-### Phase 1（完整路由）
-1. 引入 `WebResultEvaluator` + `WebRouter`
-2. 支持 `direct_fusion` 与 `rag_fusion` 自动分流
-3. 增加冲突信息识别与引用优先策略
-
-### Phase 2（效果优化）
-1. 阈值网格调参（基于评测集）
-2. 实体词表/领域词表迭代
-3. 加入缓存（query+time-window）降成本与提速
+1. Phase A：上线 `RAG-first + 低置信补Web`（先拿稳定收益）。
+2. Phase B：加入“高风险并行触发”与Web双层采信。
+3. Phase C：引入缓存与阈值自动校准（按离线评测集调参）。
 
 ---
 
-## 9. 测试计划
+## 8. 最终建议
 
-新增测试建议：
-1. `tests/test_query_analyzer.py`
-- 时效词触发
-- OOV+领域相关触发
-- 本地覆盖不足触发
+采用 `3.3 自适应混合路由` 作为目标架构，短期按 `3.2` 方式快速上线，再叠加“并行触发条件 + 双层采信 + 分层兜底”。  
+这样可以在不显著增加成本的前提下，减少“哭哭马这类实体误判”和“政策时效失真”。
 
-2. `tests/test_web_router.py`
-- 海量结果走 `rag_fusion`
-- 精准结果走 `direct_fusion`
-- 失败回退本地RAG
-
-3. `tests/test_bot_generation_mode.py` 扩展
-- 覆盖 `trace.search.web.fusion_strategy` 与 fallback 行为
-
----
-
-## 10. 验收标准（Definition of Done）
-
-1. 对“最近+新政策+知识库外实体”类问题，`need_web_search` 召回率可接受（先追求 Recall）
-2. 路由决策可解释（trace 有明确 reasons + metrics）
-3. 不破坏现有网关与 RAG 回退能力
-4. 默认配置下行为与当前版本一致（兼容 `../ECBot` 合并）
