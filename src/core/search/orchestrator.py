@@ -6,6 +6,11 @@ import math
 import re
 from typing import Any, Literal, Protocol
 
+from src.core.search.lite_gate import (
+    LOW_RELEVANCE_REASON_CODE,
+    compute_l1_confidence,
+    should_trigger_full_rag,
+)
 from src.core.search.planner import Planner, PlannerOutput
 from src.core.search.query_analyzer import QueryAnalysis
 from src.core.search.rag_search import SearchResult
@@ -13,6 +18,9 @@ from src.core.search.source_utils import build_grouped_citations
 from src.core.search.web_search_client import WebSearchResult
 from src.core.trace_builder import (
     TraceFallbackReason,
+    build_gate_decision_trace,
+    build_l1_trace,
+    build_l2_trace,
     build_orchestrator_trace,
     build_web_trace,
     merge_reason_codes,
@@ -38,6 +46,29 @@ class OrchestratorResult:
     citations: list[dict[str, Any]]
     retrieval_confidence: float
     trace_search: dict[str, Any]
+
+
+@dataclass
+class L1Result:
+    hits: list[UnifiedSearchHit]
+    confidence: float
+    trace: dict[str, Any]
+
+
+@dataclass
+class L2Result:
+    hits: list[UnifiedSearchHit]
+    citations: list[dict[str, Any]]
+    retrieval_confidence: float
+    trace: dict[str, Any]
+
+
+@dataclass
+class RouteDecision:
+    trigger_full_rag: bool
+    reason_code: str
+    threshold: float
+    l1_confidence: float
 
 
 class QueryAnalyzerProtocol(Protocol):
@@ -102,6 +133,67 @@ class SearchOrchestrator:
         self.answer_top_k = max(1, int(answer_top_k))
 
     def search_with_trace(self, query: str) -> OrchestratorResult:
+        l1_result = self.run_l1_partial(query)
+        decision = self.route_by_l1_confidence(l1_result)
+        decision_trace = build_gate_decision_trace(
+            l1_confidence=l1_result.confidence,
+            threshold=decision.threshold,
+            trigger_full_rag=decision.trigger_full_rag,
+            reason_code=decision.reason_code,
+        )
+
+        if decision.trigger_full_rag:
+            l2_result = self.run_l2_full(query, l1_result)
+            trace_search = dict(l2_result.trace or {})
+            trace_search["decision"] = decision_trace
+            return OrchestratorResult(
+                hits=l2_result.hits,
+                citations=l2_result.citations,
+                retrieval_confidence=l2_result.retrieval_confidence,
+                trace_search=trace_search,
+            )
+
+        l1_hits = l1_result.hits[: self._l2_max_top_k()]
+        citations = build_grouped_citations(l1_hits)
+        retrieval_confidence = float(l1_result.confidence)
+        rag_trace = dict(l1_result.trace.get("rag_trace", {})) if isinstance(l1_result.trace, dict) else {}
+        web_trace = build_web_trace(
+            requested=False,
+            route_mode="lite_gate",
+            need_web_search=False,
+            reasons=[decision.reason_code],
+            metrics={"gate_blocked": True},
+        )
+        web_trace["execution_skipped"] = True
+        web_trace["skip_reason"] = decision.reason_code
+        l2_trace = build_l2_trace(
+            executed=False,
+            reason_code=decision.reason_code,
+            hit_count=0,
+            retrieval_confidence=0.0,
+            metrics={"gate_blocked": True},
+        )
+        trace_search = build_orchestrator_trace(
+            query=query,
+            rag_trace=rag_trace,
+            analysis=dict(l1_result.trace.get("analysis", {})) if isinstance(l1_result.trace, dict) else {},
+            planner={},
+            rag_executed=False,
+            web_trace=web_trace,
+            web_search_interface_ready=self.web_searcher is not None,
+            final_results=[self._hit_to_trace_row(item) for item in l1_hits],
+        )
+        trace_search["l1"] = dict(l1_result.trace.get("l1", {})) if isinstance(l1_result.trace, dict) else {}
+        trace_search["l2"] = l2_trace
+        trace_search["decision"] = decision_trace
+        return OrchestratorResult(
+            hits=l1_hits,
+            citations=citations,
+            retrieval_confidence=retrieval_confidence,
+            trace_search=trace_search,
+        )
+
+    def run_l1_partial(self, query: str) -> L1Result:
         self.planner.plan(
             query,
             trace_context={"query_analysis": {"need_web_search": False, "reason_codes": ["bootstrap"]}},
@@ -109,8 +201,55 @@ class SearchOrchestrator:
 
         rag_hits, rag_trace = self.rag_searcher.search_with_trace(query)
         local_hits = [self._to_unified_hit(item) for item in rag_hits]
-        rag_executed = True
+        query_analysis = self._analyze_query(
+            query=query,
+            local_hits=local_hits,
+            rag_trace=rag_trace,
+        )
+        l1_metrics = {
+            "coverage_score": float(query_analysis.kb_coverage_score),
+            "entity_score": float(1.0 - min(1.0, max(0.0, query_analysis.oov_entity_score))),
+            "evidence_count": len(local_hits),
+            "kb_result_count": len(local_hits),
+        }
+        threshold = self._l1_trigger_threshold()
+        l1_confidence = compute_l1_confidence(
+            local_hits,
+            {
+                "metrics": l1_metrics,
+            },
+        )
+        l1_trace = build_l1_trace(
+            confidence=l1_confidence,
+            threshold=threshold,
+            hit_count=len(local_hits),
+            reason_codes=list(query_analysis.reasons),
+            metrics=l1_metrics,
+        )
+        return L1Result(
+            hits=local_hits,
+            confidence=l1_confidence,
+            trace={
+                "l1": l1_trace,
+                "analysis": query_analysis.to_dict(),
+                "rag_trace": dict(rag_trace or {}),
+            },
+        )
 
+    def route_by_l1_confidence(self, l1_result: L1Result) -> RouteDecision:
+        threshold = self._l1_trigger_threshold()
+        trigger_full = should_trigger_full_rag(l1_result.confidence, threshold)
+        reason_code = "L2_FULL_RAG_TRIGGERED" if trigger_full else LOW_RELEVANCE_REASON_CODE
+        return RouteDecision(
+            trigger_full_rag=trigger_full,
+            reason_code=reason_code,
+            threshold=threshold,
+            l1_confidence=float(l1_result.confidence),
+        )
+
+    def run_l2_full(self, query: str, l1_result: L1Result) -> L2Result:
+        local_hits = list(l1_result.hits)
+        rag_trace = dict(l1_result.trace.get("rag_trace", {})) if isinstance(l1_result.trace, dict) else {}
         query_analysis = self._analyze_query(
             query=query,
             local_hits=local_hits,
@@ -133,22 +272,36 @@ class SearchOrchestrator:
             query_analysis=query_analysis,
         )
 
-        citations = build_grouped_citations(merged_hits)
-        retrieval_confidence = self._compute_confidence(merged_hits)
+        l2_max_top_k = self._l2_max_top_k()
+        selected_hits = merged_hits[:l2_max_top_k]
+        citations = build_grouped_citations(selected_hits)
+        retrieval_confidence = self._compute_confidence(selected_hits)
+        l2_trace = build_l2_trace(
+            executed=True,
+            reason_code="L2_EXECUTED",
+            hit_count=len(selected_hits),
+            retrieval_confidence=retrieval_confidence,
+            metrics={
+                "l2_max_top_k": l2_max_top_k,
+                "web_fusion_strategy": str(web_trace.get("fusion_strategy", "none")),
+            },
+        )
         trace_search = self._build_trace(
             query=query,
             planner_output=planner_output,
             query_analysis=query_analysis,
             rag_trace=rag_trace,
-            hits=merged_hits,
-            rag_executed=rag_executed,
+            hits=selected_hits,
+            rag_executed=True,
             web_trace=web_trace,
+            l1_trace=dict(l1_result.trace.get("l1", {})) if isinstance(l1_result.trace, dict) else {},
+            l2_trace=l2_trace,
         )
-        return OrchestratorResult(
-            hits=merged_hits,
+        return L2Result(
+            hits=selected_hits,
             citations=citations,
             retrieval_confidence=retrieval_confidence,
-            trace_search=trace_search,
+            trace=trace_search,
         )
 
     def _analyze_query(
@@ -858,6 +1011,8 @@ class SearchOrchestrator:
         hits: list[UnifiedSearchHit],
         rag_executed: bool,
         web_trace: dict[str, Any],
+        l1_trace: dict[str, Any] | None = None,
+        l2_trace: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         planner_trace = {
             "plan_id": planner_output.plan_id,
@@ -871,7 +1026,7 @@ class SearchOrchestrator:
             "query_expansion": planner_output.query_expansion,
             "retrieval_plan": planner_output.retrieval_plan,
         }
-        return build_orchestrator_trace(
+        trace = build_orchestrator_trace(
             query=query,
             rag_trace=rag_trace,
             analysis=query_analysis.to_dict(),
@@ -881,6 +1036,9 @@ class SearchOrchestrator:
             web_search_interface_ready=self.web_searcher is not None,
             final_results=[self._hit_to_trace_row(item) for item in hits],
         )
+        trace["l1"] = dict(l1_trace or {})
+        trace["l2"] = dict(l2_trace or {})
+        return trace
 
     def _apply_phase_a_serial_signals(
         self,
@@ -956,6 +1114,23 @@ class SearchOrchestrator:
             return max(0.0, min(1.0, float(raw_value)))
         except Exception:
             return default_threshold
+
+    def _l1_trigger_threshold(self) -> float:
+        default_threshold = self._phase_a_rag_confidence_threshold()
+        search_cfg = getattr(self.config, "search", None)
+        raw_value = getattr(search_cfg, "l1_trigger_threshold", default_threshold)
+        try:
+            return max(0.0, min(1.0, float(raw_value)))
+        except Exception:
+            return default_threshold
+
+    def _l2_max_top_k(self) -> int:
+        search_cfg = getattr(self.config, "search", None)
+        raw_value = getattr(search_cfg, "l2_max_top_k", max(self.answer_top_k, 6))
+        try:
+            return max(1, int(raw_value))
+        except Exception:
+            return max(1, self.answer_top_k)
 
     def _phase_a_kb_confidence(self, local_hits: list[UnifiedSearchHit]) -> float:
         if not local_hits:

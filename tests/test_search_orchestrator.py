@@ -265,7 +265,7 @@ def test_orchestrator_executes_web_and_fuses_results() -> None:
     assert "temporal" in dynamic["alpha_components"]
 
 
-def test_orchestrator_phase_a_triggers_web_when_rag_confidence_is_low() -> None:
+def test_orchestrator_blocks_l2_when_l1_confidence_is_low() -> None:
     rag_searcher = _LowConfidenceRAGSearcher()
     planner = _StubPlanner(
         output=PlannerOutput(
@@ -300,8 +300,48 @@ def test_orchestrator_phase_a_triggers_web_when_rag_confidence_is_low() -> None:
     result = orchestrator.search_with_trace("category trend")
 
     assert rag_searcher.called == 1
-    assert web_client.called == 1
-    assert result.trace_search["web"]["executed"] is True
-    assert result.trace_search["web"]["need_web_search"] is True
-    assert "phase_a_low_confidence_trigger" in result.trace_search["web"]["reasons"]
-    assert result.trace_search["web"]["metrics"]["kb_confidence_score"] < 0.58
+    assert web_client.called == 0
+    assert result.trace_search["decision"]["trigger_full_rag"] is False
+    assert result.trace_search["decision"]["reason_code"] == "LOW_RELEVANCE_GATE"
+    assert result.trace_search["l2"]["executed"] is False
+
+
+def test_orchestrator_exposes_l1_and_route_decision_methods() -> None:
+    rag_searcher = _LowConfidenceRAGSearcher()
+    planner = _StubPlanner(
+        output=PlannerOutput(
+            plan_id="plan-lite",
+            need_web_search=False,
+            source_route="kb_only",
+            fusion_strategy="none",
+            domain_relevance_score=0.86,
+            reasons=["manual_planner_no_web"],
+            retrieval_plan={"sources": [{"name": "kb_index", "enabled": True}]},
+        )
+    )
+    orchestrator = SearchOrchestrator(
+        planner=planner,
+        rag_searcher=rag_searcher,
+        web_searcher=None,
+        config=SimpleNamespace(
+            search=SimpleNamespace(
+                l1_trigger_threshold=0.6,
+                l2_max_top_k=4,
+                phase_a_rag_confidence_threshold=0.58,
+                web_search_enabled=False,
+                web_rag_max_docs=4,
+                web_search_provider="mock",
+            )
+        ),
+        query_analyzer=_NoWebAnalyzer(),
+        web_result_evaluator=None,
+        web_router=None,
+    )
+
+    l1_result = orchestrator.run_l1_partial("category trend")
+    decision = orchestrator.route_by_l1_confidence(l1_result)
+
+    assert rag_searcher.called == 1
+    assert l1_result.trace["l1"]["hit_count"] == 2
+    assert decision.trigger_full_rag is False
+    assert decision.reason_code == "LOW_RELEVANCE_GATE"

@@ -82,6 +82,55 @@ def build_web_trace(
     }
 
 
+def build_l1_trace(
+    *,
+    confidence: float,
+    threshold: float,
+    hit_count: int,
+    reason_codes: Iterable[ReasonCode] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "confidence": max(0.0, min(1.0, float(confidence))),
+        "threshold": max(0.0, min(1.0, float(threshold))),
+        "hit_count": max(0, int(hit_count)),
+        "reason_codes": [reason_text(item) for item in (reason_codes or []) if reason_text(item)],
+        "metrics": dict(metrics or {}),
+    }
+
+
+def build_l2_trace(
+    *,
+    executed: bool,
+    reason_code: ReasonCode = "",
+    hit_count: int = 0,
+    retrieval_confidence: float = 0.0,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "executed": bool(executed),
+        "reason_code": reason_text(reason_code),
+        "hit_count": max(0, int(hit_count)),
+        "retrieval_confidence": max(0.0, min(1.0, float(retrieval_confidence))),
+        "metrics": dict(metrics or {}),
+    }
+
+
+def build_gate_decision_trace(
+    *,
+    l1_confidence: float,
+    threshold: float,
+    trigger_full_rag: bool,
+    reason_code: ReasonCode,
+) -> dict[str, Any]:
+    return {
+        "l1_confidence": max(0.0, min(1.0, float(l1_confidence))),
+        "threshold": max(0.0, min(1.0, float(threshold))),
+        "trigger_full_rag": bool(trigger_full_rag),
+        "reason_code": reason_text(reason_code),
+    }
+
+
 def normalize_web_trace(search_trace: dict[str, Any]) -> None:
     web_trace = search_trace.get("web")
     if not isinstance(web_trace, dict):

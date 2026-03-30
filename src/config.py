@@ -126,6 +126,9 @@ class SearchConfig:
     )
     web_rag_max_docs: int = 16
     phase_a_rag_confidence_threshold: float = 0.58
+    l1_trigger_threshold: float = 0.58
+    l1_template_enabled: bool = True
+    l2_max_top_k: int = 8
     merge_web_trigger_requires_rag_gap: bool = True
     merge_trigger_on_kb_empty: bool = True
     merge_trigger_on_low_confidence: bool = True
@@ -422,6 +425,25 @@ class Config:
                 _env(
                     "ECBOT_PHASE_A_RAG_CONFIDENCE_THRESHOLD",
                     search_data.get("phase_a_rag_confidence_threshold", 0.58),
+                )
+            ),
+            l1_trigger_threshold=float(
+                _env(
+                    "ECBOT_L1_TRIGGER_THRESHOLD",
+                    search_data.get("l1_trigger_threshold", 0.58),
+                )
+            ),
+            l1_template_enabled=_as_bool(
+                _env(
+                    "ECBOT_L1_TEMPLATE_ENABLED",
+                    search_data.get("l1_template_enabled", True),
+                ),
+                True,
+            ),
+            l2_max_top_k=int(
+                _env(
+                    "ECBOT_L2_MAX_TOP_K",
+                    search_data.get("l2_max_top_k", 8),
                 )
             ),
             merge_web_trigger_requires_rag_gap=merge_web_trigger_requires_rag_gap,

@@ -7,6 +7,7 @@ from typing import Any
 
 from src.config import Config
 from src.core.generation import GenerationClient
+from src.core.search.lite_gate import LOW_RELEVANCE_REASON_CODE, build_template_response
 from src.core.search.orchestrator import SearchOrchestrator, UnifiedSearchHit
 from src.core.search.planner import RulePlanner
 from src.core.search.query_analyzer import QueryAnalysis, QueryAnalyzer
@@ -158,6 +159,14 @@ class ReActAgent:
                 retrieval_confidence=0.0,
                 trace=blocked_trace if include_trace else {},
             )
+
+        lite_response = self.run_lite_pipeline(
+            query=query,
+            include_trace=include_trace,
+            manifest_gate=manifest_gate,
+        )
+        if lite_response is not None:
+            return lite_response
 
         citations_from_search: list[dict[str, Any]] | None = None
         confidence_from_search = 0.0
@@ -317,6 +326,170 @@ class ReActAgent:
         trace["retrieval_confidence"] = confidence
         trace["retrieved_results"] = [asdict(result) for result in results]
 
+        return AgentResponse(
+            answer=answer,
+            citations=citations,
+            retrieval_confidence=confidence,
+            trace=trace if include_trace else {},
+        )
+
+    def run_lite_pipeline(
+        self,
+        query: str,
+        *,
+        include_trace: bool = False,
+        manifest_gate: dict[str, Any] | None = None,
+    ) -> AgentResponse | None:
+        orchestrator = getattr(self, "search_orchestrator", None)
+        required_methods = ("run_l1_partial", "route_by_l1_confidence", "run_l2_full")
+        if orchestrator is None or not all(hasattr(orchestrator, name) for name in required_methods):
+            return None
+
+        if hasattr(orchestrator, "answer_top_k"):
+            orchestrator.answer_top_k = self.answer_top_k
+
+        try:
+            l1_result = orchestrator.run_l1_partial(query)
+            decision = orchestrator.route_by_l1_confidence(l1_result)
+        except Exception:
+            return None
+
+        manifest_gate_payload = dict(manifest_gate or {})
+        manifest = manifest_gate_payload.get("manifest", {})
+        l1_confidence = float(getattr(decision, "l1_confidence", getattr(l1_result, "confidence", 0.0)) or 0.0)
+        threshold = float(getattr(decision, "threshold", 0.58) or 0.58)
+        trigger_full_rag = bool(getattr(decision, "trigger_full_rag", True))
+        reason_code = str(getattr(decision, "reason_code", LOW_RELEVANCE_REASON_CODE) or LOW_RELEVANCE_REASON_CODE)
+
+        template_enabled = bool(getattr(getattr(self.config, "search", None), "l1_template_enabled", True))
+        if not template_enabled:
+            trigger_full_rag = True
+            reason_code = "L1_TEMPLATE_DISABLED"
+
+        if not trigger_full_rag:
+            answer = build_template_response(query=query, reason_code=reason_code)
+            search_trace = {}
+            raw_l1_trace = getattr(l1_result, "trace", {})
+            if isinstance(raw_l1_trace, dict):
+                search_trace = dict(raw_l1_trace)
+            search_trace["manifest_gate"] = manifest_gate_payload
+            search_trace["decision"] = {
+                "l1_confidence": l1_confidence,
+                "threshold": threshold,
+                "trigger_full_rag": False,
+                "reason_code": reason_code,
+            }
+            search_trace.setdefault(
+                "l2",
+                {
+                    "executed": False,
+                    "reason_code": reason_code,
+                    "hit_count": 0,
+                    "retrieval_confidence": 0.0,
+                    "metrics": {},
+                },
+            )
+            self._normalize_web_trace(search_trace)
+            trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+            trace["strategy_execution"].append(
+                {
+                    "stage": "l1_gate",
+                    "decision": "template_response",
+                    "reason_code": reason_code,
+                    "l1_confidence": l1_confidence,
+                    "threshold": threshold,
+                }
+            )
+            trace["final_answer_preview"] = answer
+            trace["final_citations"] = []
+            trace["retrieval_confidence"] = l1_confidence
+            return AgentResponse(
+                answer=answer,
+                citations=[],
+                retrieval_confidence=l1_confidence,
+                trace=trace if include_trace else {},
+            )
+
+        try:
+            l2_result = orchestrator.run_l2_full(query, l1_result)
+        except Exception:
+            return None
+
+        results = self._coerce_search_hits(getattr(l2_result, "hits", []))
+        search_trace = getattr(l2_result, "trace", {})
+        if not isinstance(search_trace, dict):
+            search_trace = {}
+        search_trace["manifest_gate"] = manifest_gate_payload
+        self._normalize_web_trace(search_trace)
+
+        trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+        trace["strategy_execution"].append(
+            {
+                "stage": "l1_gate",
+                "decision": "trigger_full_rag",
+                "reason_code": reason_code,
+                "l1_confidence": l1_confidence,
+                "threshold": threshold,
+            }
+        )
+
+        if not results:
+            planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
+            filter_reason = str(planner_trace.get("filter_reason", "")).strip()
+            reason = (
+                TraceFallbackReason.INDEX_NOT_READY.value
+                if bool(manifest_gate_payload.get("blocked", False))
+                else TraceFallbackReason.NO_RETRIEVAL_RESULTS.value
+            )
+            answer = (
+                "当前索引尚未就绪，请先执行离线知识库同步。"
+                if reason == TraceFallbackReason.INDEX_NOT_READY.value
+                else "未从知识库检索到足够相关内容，请补充更具体的问题后重试。"
+            )
+            trace["strategy_execution"].append(
+                build_strategy_fallback_step(reason=reason, filter_reason=filter_reason)
+            )
+            trace["final_answer_preview"] = answer
+            trace["final_citations"] = []
+            trace["retrieval_confidence"] = 0.0
+            return AgentResponse(
+                answer=answer,
+                citations=[],
+                retrieval_confidence=0.0,
+                trace=trace if include_trace else {},
+            )
+
+        selected = results[: self.answer_top_k]
+        raw_citations = getattr(l2_result, "citations", None)
+        citations = raw_citations if isinstance(raw_citations, list) else self._build_citations(selected)
+        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        template_answer = self._render_template_answer(draft)
+        answer, generation_meta = self._compose_answer(
+            draft=draft,
+            template_answer=template_answer,
+            search_trace=search_trace,
+        )
+        confidence = max(
+            float(getattr(l2_result, "retrieval_confidence", 0.0) or 0.0),
+            min(1.0, sum(max(0.0, item.score) for item in selected) / max(len(selected), 1)),
+        )
+
+        trace["strategy_execution"].append(
+            {
+                "stage": "context_selection",
+                "selected_results": [asdict(item) for item in selected],
+            }
+        )
+        trace["strategy_execution"].append(
+            {
+                "stage": "answer_generation",
+                "meta": generation_meta,
+            }
+        )
+        trace["final_answer_preview"] = answer
+        trace["final_citations"] = citations
+        trace["retrieval_confidence"] = confidence
+        trace["retrieved_results"] = [asdict(result) for result in results]
         return AgentResponse(
             answer=answer,
             citations=citations,

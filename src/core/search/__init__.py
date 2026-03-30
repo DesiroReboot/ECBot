@@ -1,7 +1,15 @@
 from .query_analyzer import QueryAnalysis, QueryAnalyzer
 from .rag_search import RAGSearcher, SearchResult
 from .planner import FusionStrategy, Planner, PlannerOutput, RulePlanner, SourceRoute
-from .orchestrator import OrchestratorResult, SearchOrchestrator, UnifiedSearchHit, WebSearcher
+from .orchestrator import (
+    L1Result,
+    L2Result,
+    OrchestratorResult,
+    RouteDecision,
+    SearchOrchestrator,
+    UnifiedSearchHit,
+    WebSearcher,
+)
 from .web_result_evaluator import WebEvaluation, WebResultEvaluator
 from .web_router import WebRouteDecision, WebRouter
 from .web_search_client import WebSearchClient, WebSearchResult
@@ -17,6 +25,9 @@ __all__ = [
     "SearchOrchestrator",
     "WebSearcher",
     "UnifiedSearchHit",
+    "L1Result",
+    "L2Result",
+    "RouteDecision",
     "OrchestratorResult",
     "QueryAnalyzer",
     "QueryAnalysis",
