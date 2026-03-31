@@ -134,6 +134,105 @@ def test_render_template_answer_prefers_paragraph_and_keeps_sources() -> None:
     assert "trade-guide.md" in answer
 
 
+def test_render_template_answer_does_not_duplicate_punctuation_before_source_tag() -> None:
+    generation = GenerationConfig(mode="template")
+    agent = _build_agent(generation=generation)
+    draft = AnswerDraft(
+        query="FOB价格组成",
+        theme="logistics",
+        steps=[],
+        evidence=[],
+        source_rows=["[S1] trade-guide.md | chunk#1 | reference"],
+        citations=[{"source": "trade-guide.md", "aliases": []}],
+        fact_units=[
+            {
+                "statement": "FOB价格 = EXW价格 + 国内运费 + 报关费 + 装船费 + 港口杂费。",
+                "source": "trade-guide.md",
+            }
+        ],
+    )
+
+    answer = agent._render_template_answer(draft)
+
+    assert "。[S1]。" not in answer
+
+
+def test_render_template_answer_keeps_truncated_fragment_without_forced_period() -> None:
+    generation = GenerationConfig(mode="template")
+    agent = _build_agent(generation=generation)
+    draft = AnswerDraft(
+        query="DDP价格组成",
+        theme="logistics",
+        steps=[],
+        evidence=[],
+        source_rows=["[S1] trade-guide.md | chunk#2 | reference"],
+        citations=[{"source": "trade-guide.md", "aliases": []}],
+        fact_units=[
+            {
+                "statement": "DDP价格 = EXW价格 + 所有运输费 + 报关费 +",
+                "source": "trade-guide.md",
+            }
+        ],
+    )
+
+    answer = agent._render_template_answer(draft)
+    first_line = answer.splitlines()[0]
+
+    assert not first_line.endswith("。")
+
+
+def test_render_template_answer_detail_line_uses_semicolon_and_period_tail() -> None:
+    generation = GenerationConfig(mode="template")
+    agent = _build_agent(generation=generation)
+    draft = AnswerDraft(
+        query="FOB价格组成",
+        theme="logistics",
+        steps=[],
+        evidence=[],
+        source_rows=["[S1] trade-guide.md | chunk#3 | reference"],
+        citations=[{"source": "trade-guide.md", "aliases": []}],
+        fact_units=[
+            {"statement": "FOB价格 = EXW价格 + 国内运费 + 报关费 + 装船费 + 港口杂费", "source": "trade-guide.md"},
+            {"statement": "CFR价格 = FOB价格 + 国际海运费", "source": "trade-guide.md"},
+            {"statement": "CIF价格 = FOB价格 + 国际海运费 + 海运保险费", "source": "trade-guide.md"},
+        ],
+    )
+
+    answer = agent._render_template_answer(draft)
+    detail_line = answer.splitlines()[2]
+
+    assert detail_line.startswith("进一步可确认的是：")
+    assert "；" in detail_line
+    assert detail_line.endswith("。")
+
+
+def test_render_template_answer_steps_do_not_emit_period_semicolon_combo() -> None:
+    generation = GenerationConfig(mode="template")
+    agent = _build_agent(generation=generation)
+    draft = AnswerDraft(
+        query="如何打造爆款",
+        theme="logistics",
+        answer_mode="procedure",
+        steps=[
+            "先确认发货模式、时效和成本边界。",
+            "核对报关资料与标签包装完整性。",
+            "建立异常预案并跟踪关键物流节点。",
+        ],
+        evidence=[],
+        source_rows=["[S1] trade-guide.md | chunk#4 | reference"],
+        citations=[{"source": "trade-guide.md", "aliases": []}],
+        fact_units=[
+            {"statement": "运营要求：需要组建内容团队（建议至少2人专项运营）", "source": "trade-guide.md"},
+        ],
+    )
+
+    answer = agent._render_template_answer(draft)
+    step_line = next((line for line in answer.splitlines() if line.startswith("可执行顺序建议：")), "")
+
+    assert "。；" not in step_line
+    assert step_line.endswith("。")
+
+
 def test_run_sync_returns_no_retrieval_fallback_when_search_empty() -> None:
     agent = ReActAgent.__new__(ReActAgent)
     agent.search_orchestrator = SimpleNamespace(

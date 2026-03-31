@@ -1383,22 +1383,86 @@ class ReActAgent:
         if not tagged_statements:
             tagged_statements = ["当前检索证据不足，无法给出可验证的关系结论。[S1]"]
 
-        lead = f"围绕“{draft.query}”，当前证据显示：{tagged_statements[0]}。"
+        lead = self._append_terminal_punctuation(
+            f"围绕“{draft.query}”，当前证据显示：{tagged_statements[0]}",
+            allow_semicolon=False,
+        )
         detail = ""
         if len(tagged_statements) > 1:
-            detail = "进一步可确认的是：" + "；".join(tagged_statements[1:]) + "。"
+            detail = self._append_terminal_punctuation(
+                "进一步可确认的是：" + "；".join(tagged_statements[1:]),
+                allow_semicolon=False,
+            )
 
         lines = [lead]
         if detail:
             lines.append(detail)
         if draft.answer_mode in {"procedure", "mixed"} and draft.steps:
-            steps_text = "；".join(step.strip() for step in draft.steps[:3] if step.strip())
+            normalized_steps = [
+                self._trim_terminal_punctuation(step.strip())
+                for step in draft.steps[:3]
+                if step and step.strip()
+            ]
+            steps_text = "；".join(step for step in normalized_steps if step)
             if steps_text:
-                lines.append(f"可执行顺序建议：{steps_text}。")
+                lines.append(
+                    self._append_terminal_punctuation(
+                        f"可执行顺序建议：{steps_text}",
+                        allow_semicolon=False,
+                    )
+                )
         lines.append("来源：")
         for row in draft.source_rows:
             lines.append(f"- {row}")
         return "\n\n".join(lines[:2]) + ("\n\n" + "\n".join(lines[2:]) if len(lines) > 2 else "")
+
+    def _append_terminal_punctuation(self, text: str, *, allow_semicolon: bool = True) -> str:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return stripped
+        if self._has_terminal_punctuation(stripped) or self._looks_truncated_fragment(stripped):
+            return stripped
+        punct = self._choose_fallback_punctuation(stripped, allow_semicolon=allow_semicolon)
+        return f"{stripped}{punct}"
+
+    def _choose_fallback_punctuation(self, text: str, *, allow_semicolon: bool = True) -> str:
+        normalized = self._strip_trailing_source_tags(text)
+        if allow_semicolon and self._looks_formula_or_enumeration(normalized):
+            return "；"
+        return "。"
+
+    def _has_terminal_punctuation(self, text: str) -> bool:
+        normalized = self._strip_trailing_source_tags(text)
+        return bool(normalized) and normalized[-1] in "。！？；：…,.!?;:"
+
+    def _looks_truncated_fragment(self, text: str) -> bool:
+        normalized = self._strip_trailing_source_tags(text)
+        if not normalized:
+            return False
+        if re.search(r"(和|及|与|等|包括|为|to|and|or|with|including|include)$", normalized, re.IGNORECASE):
+            return True
+        if normalized.endswith(("+", "-", "/", "=", "（", "(", "、", "，", ",")):
+            return True
+        return False
+
+    def _looks_formula_or_enumeration(self, text: str) -> bool:
+        normalized = self._strip_trailing_source_tags(text)
+        if not normalized:
+            return False
+        if "=" in normalized or "+" in normalized or "、" in normalized:
+            return True
+        comma_parts = [part for part in re.split(r"[，,]", normalized) if part.strip()]
+        return len(comma_parts) >= 3
+
+    def _strip_trailing_source_tags(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        return re.sub(r"(?:\s*\[S\d+\])+\s*$", "", normalized).rstrip()
+
+    def _trim_terminal_punctuation(self, text: str) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        return re.sub(r"[。！？；：…,.!?;:]+$", "", normalized).strip()
 
     @staticmethod
     def _infer_section_locator(item: Any) -> str:
